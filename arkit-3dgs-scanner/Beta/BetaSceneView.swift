@@ -17,6 +17,11 @@ struct BetaSceneView: View {
     @State private var renaming = false
     @State private var showMap = false
     @State private var confirmDelete = false
+    @State private var cameraReport: CapturePhotogrammetry.Report?
+    @State private var estimationTask: Task<Void, Never>?
+    @State private var estimating = false
+    @State private var estimationProgress = 0.0
+    @State private var exportContents: BetaSceneArchive.Contents = .reconstruction
     @Environment(\.dismiss) private var dismiss
     @Environment(\.scenePhase) private var scenePhase
     var body: some View {
@@ -81,10 +86,39 @@ struct BetaSceneView: View {
                             .font(.caption).foregroundStyle(.secondary)
                     }
                     if let notice = preview.processingNotice { Text(notice).font(.caption).foregroundStyle(.orange) }
+                    if entry?.isVideoImport == false {
+                        VStack(alignment: .leading, spacing: 10) {
+                            Text(L10n.text("摄影测量相机参数")).font(.headline)
+                            Text(cameraEstimationNotice).font(.caption).foregroundStyle(.secondary)
+                            if estimating {
+                                ProgressView(value: estimationProgress)
+                                Text(L10n.text("RealityKit 相机估计需要保持 App 在前台。"))
+                                    .font(.caption).foregroundStyle(.orange)
+                                Button(L10n.text("取消")) { estimationTask?.cancel() }
+                            } else {
+                                Button(L10n.text("重新估计相机参数"), action: estimateCameras)
+                                    .disabled(saving).accessibilityIdentifier("betaEstimateCameras")
+                            }
+                        }.frame(maxWidth: .infinity, alignment: .leading).padding(20)
+                            .background(DS.Palette.surfaceRaised, in: RoundedRectangle(cornerRadius: 18))
+                    }
                     VStack(alignment: .leading, spacing: 10) {
                         Text(L10n.text("场景数据包")).font(.headline)
-                        Label(L10n.text("原始视频"), systemImage: "film")
-                        Label(L10n.text("逐帧图像与相机位姿"), systemImage: "photo.stack")
+                        Picker(L10n.text("保存内容"), selection: $exportContents) {
+                            Text(L10n.text("重建结果")).tag(BetaSceneArchive.Contents.reconstruction)
+                            Text(L10n.text("原始归档")).tag(BetaSceneArchive.Contents.original)
+                        }.pickerStyle(.segmented).disabled(saving || estimating)
+                            .accessibilityIdentifier("betaExportContents")
+                        if exportContents == .original {
+                            Label(L10n.text("原始视频"), systemImage: "film")
+                            Label(L10n.text("逐帧图像与相机位姿"), systemImage: "photo.stack")
+                        } else {
+                            Label(L10n.text("仅通过筛选的图像与相机参数"), systemImage: "checkmark.circle")
+                            Text(entry?.isVideoImport == true
+                                 ? L10n.text("仅包含有效图像与对应相机参数；原视频与未筛选点云保留在原始归档中。")
+                                 : L10n.text("图像、两套相机参数和深度使用同一有效帧名单；完整视频与未筛选点云保留在原始归档中。"))
+                                .font(.caption).foregroundStyle(.secondary)
+                        }
                         if includeLiDAR { Label(L10n.text("LiDAR 深度与置信度"), systemImage: "square.3.layers.3d") }
                         Text("ZIP · JPEG · JSONL" + (includeLiDAR ? " · F32 / U8" : ""))
                             .font(.caption.monospaced()).foregroundStyle(.secondary)
@@ -100,12 +134,12 @@ struct BetaSceneView: View {
                 if entry != nil {
                     Button(role: .destructive) { confirmDelete = true } label: {
                         Label(L10n.text("删除场景"), systemImage: "trash").frame(maxWidth: .infinity).padding(.vertical, 12)
-                    }.disabled(saving).accessibilityIdentifier("betaDeleteScene")
+                    }.disabled(saving || estimating).accessibilityIdentifier("betaDeleteScene")
                 }
             }.padding(24)
         }.dsCanvas().navigationTitle(display ? "Visualization" : L10n.text("场景预览"))
             .navigationBarTitleDisplayMode(.inline)
-            .navigationBarBackButtonHidden(saving)
+            .navigationBarBackButtonHidden(saving || estimating)
             .sheet(isPresented: $renaming) {
                 if let entry { BetaRenameSheet(entry: entry) { Task { await refreshEntry(); archive = nil } } }
             }
@@ -129,15 +163,19 @@ struct BetaSceneView: View {
                     } label: {
                         if saving { ProgressView().tint(.white) }
                         else if archive != nil { Label(L10n.text("导出到文件 / 分享"), systemImage: "square.and.arrow.up") }
-                        else { Label(display ? L10n.text("保存场景 ZIP") : L10n.text("进入 Visualization"), systemImage: display ? "square.and.arrow.down" : "cube.transparent") }
-                    }.buttonStyle(DSPrimaryButtonStyle(tint: .orange)).disabled(preview == nil || saving)
+                        else { Label(display ? (exportContents == .reconstruction ? L10n.text("保存重建结果 ZIP") : L10n.text("保存原始归档 ZIP")) : L10n.text("进入 Visualization"), systemImage: display ? "square.and.arrow.down" : "cube.transparent") }
+                    }.buttonStyle(DSPrimaryButtonStyle(tint: .orange)).disabled(preview == nil || saving || estimating)
                         .accessibilityIdentifier(display ? "betaSaveZIP" : "betaVisualize")
                 }.padding(.horizontal, 24).padding(.vertical, 12).background(DS.Palette.canvas)
             }
             .onChange(of: includeLiDAR) { _, _ in archive = nil }
+            .onChange(of: exportContents) { _, _ in archive = nil }
             .task(id: directory) { await load() }
-            .onDisappear { player?.pause() }
-            .onChange(of: scenePhase) { _, phase in if phase != .active { player?.pause() } }
+            .onDisappear { player?.pause(); estimationTask?.cancel() }
+            .onChange(of: scenePhase) { _, phase in
+                if phase != .active { player?.pause() }
+                if phase == .background { estimationTask?.cancel() }
+            }
     }
     private func metric(_ value: String, _ caption: String) -> some View {
         VStack(alignment: .leading, spacing: 5) {
@@ -149,6 +187,7 @@ struct BetaSceneView: View {
         do {
             let found = try await ScanLibrary.beta.entry(at: directory)
             entry = found
+            cameraReport = CapturePhotogrammetry.readReport(in: directory)
             includeLiDAR = found.usedLiDAR == true
             preview = try await ScanLibrary.beta.preview(found)
             let files = try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)
@@ -160,10 +199,56 @@ struct BetaSceneView: View {
     private func save() {
         saving = true; error = nil
         let useDepth = includeLiDAR
+        let contents = exportContents
         Task {
             defer { saving = false }
-            do { archive = try await BetaSceneArchive.shared.save(directory: directory, includeLiDAR: useDepth) }
+            do { archive = try await BetaSceneArchive.shared.save(directory: directory, includeLiDAR: useDepth, contents: contents) }
             catch { self.error = error.localizedDescription }
+        }
+    }
+    private var cameraEstimationNotice: String {
+        guard let report = cameraReport else { return L10n.text("尚未估计，当前保存的是原始 ARKit 参数。") }
+        switch report.status {
+        case "estimated_aligned":
+            return L10n.text("已估计并对齐 \(report.estimatedFrameCount) / \(report.inputFrameCount) 张关键帧；原始参数已保留。")
+                + "\n" + L10n.text("这些结果尚未通过独立精度验证。")
+        case "unsupported": return L10n.text("设备不支持摄影测量，保留原始 ARKit 参数。")
+        case "insufficient_frames": return L10n.text("关键帧不足，摄影测量至少需要 8 张图像。")
+        case "too_many_frames": return L10n.text("关键帧超出当前设备处理上限，原始参数已保留。")
+        case "processing", "cancelled": return L10n.text("摄影测量尚未完成，原始采集已保留。")
+        default: return L10n.text("这次未生成可用的摄影测量参数，已保留原始 ARKit 参数。")
+        }
+    }
+    private func estimateCameras() {
+        guard !estimating, !saving, scenePhase == .active else { return }
+        estimating = true; estimationProgress = 0; archive = nil; player?.pause()
+        estimationTask = Task {
+            let idleTimerWasDisabled = UIApplication.shared.isIdleTimerDisabled
+            UIApplication.shared.isIdleTimerDisabled = true
+            defer {
+                UIApplication.shared.isIdleTimerDisabled = idleTimerWasDisabled
+                estimating = false; estimationTask = nil
+            }
+            do {
+                let report = try await CapturePhotogrammetry.run(directory: directory) { value in
+                    Task { @MainActor in estimationProgress = value }
+                }
+                // A Beta capture may have been interrupted only during this additional
+                // camera stage. Restore its export state after the stage has finished.
+                let infoURL = directory.appendingPathComponent("beta-capture.json")
+                let stateURL = directory.appendingPathComponent("capture-processing.json")
+                if let info = try? JSONSerialization.jsonObject(with: Data(contentsOf: infoURL)) as? [String: Any],
+                   info["rawCaptureCompleted"] as? Bool == true, report.inputFrameCount > 0,
+                   let source = try? Data(contentsOf: directory.appendingPathComponent("poses.jsonl")),
+                   CapturePhotogrammetry.hash(source) == report.sourcePosesSHA256,
+                   var state = try? JSONSerialization.jsonObject(with: Data(contentsOf: stateURL)) as? [String: Any] {
+                    state["status"] = "completed"; state["progress"] = 1
+                    try JSONSerialization.data(withJSONObject: state, options: [.sortedKeys]).write(to: stateURL, options: .atomic)
+                }
+            } catch is CancellationError { }
+            catch { self.error = error.localizedDescription }
+            cameraReport = CapturePhotogrammetry.readReport(in: directory)
+            await load()
         }
     }
     private func refreshEntry() async {

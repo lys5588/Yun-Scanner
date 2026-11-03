@@ -5,6 +5,7 @@ import SwiftUI
 extension Notification.Name { static let betaLibraryChanged = Notification.Name("betaLibraryChanged") }
 
 struct BetaLibraryView: View {
+    @State private var exportContents: BetaSceneArchive.Contents = .reconstruction
     @AppStorage("beta.library.list") private var listLayout = false
     @State private var entries: [ScanEntry] = []
     @State private var selected: Set<String> = []
@@ -73,6 +74,10 @@ struct BetaLibraryView: View {
                                 selected = selected.count == entries.count ? [] : Set(entries.map(\.id))
                             }.accessibilityIdentifier("betaSelectAll")
                         }
+                        Picker(L10n.text("保存内容"), selection: $exportContents) {
+                            Text(L10n.text("重建结果")).tag(BetaSceneArchive.Contents.reconstruction)
+                            Text(L10n.text("原始归档")).tag(BetaSceneArchive.Contents.original)
+                        }.pickerStyle(.segmented)
                         Toggle(L10n.text("包含已采集的 LiDAR"), isOn: $includeLiDAR).font(.caption).tint(.orange)
                         HStack(spacing: 12) {
                             Button(role: .destructive) { deletion = selectedEntries; confirmDelete = true } label: {
@@ -97,6 +102,7 @@ struct BetaLibraryView: View {
                 Button(L10n.text("取消"), role: .cancel) { }
             } message: { Text(L10n.text("将删除场景及原始采集数据；此前导出的 ZIP 会保留。")) }
             .task { await reload() }
+            .onChange(of: exportContents) { _, _ in archive = nil }
             .onReceive(NotificationCenter.default.publisher(for: .betaLibraryChanged)) { _ in Task { await reload() } }
     }
     @ViewBuilder private func sceneLabel(_ entry: ScanEntry) -> some View {
@@ -110,11 +116,11 @@ struct BetaLibraryView: View {
         } catch { self.error = error.localizedDescription }
     }
     private func saveBatch() {
-        let snapshot = selectedEntries, depth = includeLiDAR
+        let snapshot = selectedEntries, depth = includeLiDAR, contents = exportContents
         busy = true; error = nil; archive = nil
         Task {
             defer { busy = false }
-            do { archive = try await BetaSceneArchive.shared.saveBatch(entries: snapshot, includeLiDAR: depth) }
+            do { archive = try await BetaSceneArchive.shared.saveBatch(entries: snapshot, includeLiDAR: depth, contents: contents) }
             catch { self.error = error.localizedDescription }
         }
     }

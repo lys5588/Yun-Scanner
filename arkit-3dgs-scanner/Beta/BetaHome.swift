@@ -85,7 +85,7 @@ struct BetaHome: View {
             }
             .navigationDestination(isPresented: $library) { BetaLibraryView() }
             .fullScreenCover(isPresented: $capture, onDismiss: { revision += 1 }) {
-                CaptureView(mode: .camera, isBeta: true)
+                CaptureView(mode: .lidar, isBeta: true)
             }
             .task(id: revision) { await reload() }
             .onReceive(NotificationCenter.default.publisher(for: .betaLibraryChanged)) { _ in revision += 1 }

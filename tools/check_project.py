@@ -106,6 +106,7 @@ module_documents = {
 }
 guide_documents = {
     ROOT / 'docs' / 'App功能与真机测试指南.md',
+    ROOT / 'docs' / '数据保存格式.md',
 }
 for path in sorted(required_documents):
     check(path.exists(), f'缺少项目文档：{path.relative_to(ROOT)}')
