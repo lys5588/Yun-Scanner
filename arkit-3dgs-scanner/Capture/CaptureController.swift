@@ -409,6 +409,10 @@ final class CaptureController: NSObject, ObservableObject {
 
     private func updateProcessingBackgroundStatus() {
         guard phase == .processing else { return }
+        if isBetaCapture {
+            processingBackgroundStatus = L10n.text("RealityKit 相机估计需要保持 App 在前台。")
+            return
+        }
         processingBackgroundStatus = processingCPUReady
             ? (processingLease?.status ?? L10n.text("系统未批准后台运行，请保持 App 在前台。"))
             : L10n.text("正在完成拍摄收尾，请暂时保持 App 在前台。")
@@ -677,7 +681,7 @@ final class CaptureController: NSObject, ObservableObject {
         releaseCameraLocks()
         let generation = scanGeneration
         let cancel = fusionCancel
-        processingLease = ContinuedProcessingLease(
+        processingLease = isBetaCapture ? nil : ContinuedProcessingLease(
             title: L10n.text("相机位姿与点云重建"), requiresGPU: false,
             onExpiration: { [weak self] in self?.cancelProcessingForBackground() },
             onChange: { [weak self] in self?.updateProcessingBackgroundStatus() })
@@ -794,11 +798,22 @@ final class CaptureController: NSObject, ObservableObject {
                     let captureInfo: [String: Any] = ["schemaVersion": 1, "mode": "beta-capture",
                         "requestedLongEdge": videoLongEdge, "durationSeconds": captureSeconds,
                         "travelDistanceMeters": travelDistance, "farthestDistanceMeters": farthestDistance,
-                        "distanceSource": "arkit_tracking_estimate", "keyframeMinimumIntervalSeconds": 0.5]
+                        "distanceSource": "arkit_tracking_estimate", "keyframeMinimumIntervalSeconds": 0.5,
+                        "cameraEstimationRequested": true, "rawCaptureCompleted": true]
                     try JSONSerialization.data(withJSONObject: captureInfo, options: [.prettyPrinted, .sortedKeys])
                         .write(to: dir.appendingPathComponent("beta-capture.json"), options: .atomic)
                     reviewPoints = points
                     reviewTrajectory = refinedRecords.map { RefusionEngine.float4x4(rowMajor: $0.transform) }
+                    statusText = L10n.text("正在估计相机参数…")
+                    // RealityKit may use GPU. This Beta stage remains foreground-only;
+                    // it must never inherit the reconstruction path's CPU background grant.
+                    _ = try await CapturePhotogrammetry.run(directory: dir) { [self] fraction in
+                        Task { @MainActor [self] in
+                            guard self.isAttached, self.scanGeneration == generation else { return }
+                            self.exportProgress = 0.1 + fraction * 0.9
+                        }
+                    }
+                    guard !cancel.isCancelled, !Task.isCancelled, isAttached, generation == scanGeneration else { return }
                     exportProgress = 1
                     statusText = nil
                     succeeded = true

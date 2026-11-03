@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 // Copyright 2026. See LICENSE and NOTICE.
 import Foundation
+import CryptoKit
 
 /// Metadata-only fixtures exercise packaging, never camera/pose accuracy or video decoding.
 @main struct BetaSceneTests {
@@ -20,6 +21,12 @@ import Foundation
         try expect(portable.terminationStatus == 0, "portable UTF-8 ZIP headers and CRC")
     }
     static func main() async throws {
+        if CommandLine.arguments.count == 3 && CommandLine.arguments[1] == "--reconstruction" {
+            let source = URL(fileURLWithPath: CommandLine.arguments[2])
+            print(try await BetaSceneArchive.shared.save(directory: source, includeLiDAR: true).path)
+            return
+        }
+        try await BetaFilteredExportTests.run()
         let fm = FileManager.default
         let root = fm.temporaryDirectory.appendingPathComponent("beta-scene-test-" + UUID().uuidString)
         defer { try? fm.removeItem(at: root) }
@@ -43,6 +50,14 @@ import Foundation
         var metadata = SessionMeta(device: "test", osVersion: "test", startedAt: "2026-10-27T00:00:00Z", mode: "scene", lidarAvailable: true, lidarEnabled: true, streamCapture: stream)
         let meta = try JSONEncoder().encode(metadata)
         try meta.write(to: scene.appendingPathComponent("capture-meta.json"))
+        let estimated = Data("separate estimated cameras".utf8)
+        try fm.createDirectory(at: scene.appendingPathComponent("camera-estimation/test"), withIntermediateDirectories: true)
+        try estimated.write(to: scene.appendingPathComponent("camera-estimation/test/cameras-arkit.jsonl"))
+        try fm.createDirectory(at: scene.appendingPathComponent(".camera-estimation-unfinished"), withIntermediateDirectories: false)
+        let sourceHash = SHA256.hash(data: poses).map { String(format: "%02x", $0) }.joined()
+        let estimateReport: [String: Any] = ["status": "estimated_aligned", "cameraFile": "camera-estimation/test/cameras-arkit.jsonl",
+                                           "depthFrameIDs": [1], "sourcePosesSHA256": sourceHash]
+        try JSONSerialization.data(withJSONObject: estimateReport).write(to: scene.appendingPathComponent("camera-estimation.json"))
         let library = ScanLibrary(root: root.appendingPathComponent("beta-scenes"))
         let other = ScanLibrary(root: root.appendingPathComponent("scans"))
         try expect(try await library.entries().count == 1, "beta entry missing")
@@ -53,16 +68,22 @@ import Foundation
         try expect(try await library.entry(at: aliasScene).id == "scan_test", "directory alias must open the saved scene")
         do { _ = try await other.entry(at: aliasScene); throw NSError(domain: "accepted other library scene", code: 1) }
         catch ScanLibrary.LibraryError.invalidDirectory { }
-        let rgb = try await BetaSceneArchive.shared.save(directory: scene, includeLiDAR: false)
+        let rgb = try await BetaSceneArchive.shared.save(directory: scene, includeLiDAR: false, contents: .original)
         try unpack(rgb, to: root.appendingPathComponent("rgb"))
         let unpacked = root.appendingPathComponent("rgb/scan_test")
         try expect(fm.fileExists(atPath: unpacked.appendingPathComponent("color.mov").path), "movie missing")
         try expect(!fm.fileExists(atPath: unpacked.appendingPathComponent("depth").path), "depth leaked")
         let stripped = try String(contentsOf: unpacked.appendingPathComponent("poses.jsonl"), encoding: .utf8)
         try expect(!stripped.contains("depthFile") && !stripped.contains("confidenceFile"), "dangling depth reference")
+        let package = try JSONSerialization.jsonObject(with: Data(contentsOf: unpacked.appendingPathComponent("scene-package.json"))) as! [String: Any]
+        let estimate = package["cameraEstimation"] as! [String: Any]
+        try expect(estimate["usedDepthInput"] as? Bool == true, "depth influence provenance lost on RGB export")
+        try expect(estimate["sourcePosesSHA256BeforeExport"] as? String == sourceHash && estimate["exportedPosesSHA256"] as? String != sourceHash, "original and sanitized hashes")
+        try expect(try Data(contentsOf: unpacked.appendingPathComponent("camera-estimation/test/cameras-arkit.jsonl")) == estimated, "separate estimate missing")
+        try expect(!fm.fileExists(atPath: unpacked.appendingPathComponent(".camera-estimation-unfinished").path), "partial estimate leaked")
         try expect(try Data(contentsOf: scene.appendingPathComponent("poses.jsonl")) == poses, "original poses changed through hard links")
         try expect(try Data(contentsOf: scene.appendingPathComponent("capture-meta.json")) == meta, "original metadata changed")
-        let lidar = try await BetaSceneArchive.shared.save(directory: scene, includeLiDAR: true)
+        let lidar = try await BetaSceneArchive.shared.save(directory: scene, includeLiDAR: true, contents: .original)
         try unpack(lidar, to: root.appendingPathComponent("lidar"))
         try expect(fm.fileExists(atPath: root.appendingPathComponent("lidar/scan_test/depth/frame.f32").path), "LiDAR omitted")
         try expect(try Data(contentsOf: root.appendingPathComponent("lidar/scan_test/poses.jsonl")) == poses, "LiDAR poses changed")
@@ -86,7 +107,7 @@ import Foundation
         try JSONEncoder().encode(cameraOnly).write(to: second.appendingPathComponent("capture-meta.json"), options: .atomic)
         try fm.removeItem(at: second.appendingPathComponent("depth"))
         let entries = try await library.entries()
-        let batch = try await BetaSceneArchive.shared.saveBatch(entries: entries, includeLiDAR: true)
+        let batch = try await BetaSceneArchive.shared.saveBatch(entries: entries, includeLiDAR: true, contents: .original)
         try unpack(batch, to: root.appendingPathComponent("batch"))
         let batchRoot = root.appendingPathComponent("batch/Scenes")
         let batchIndex = try JSONSerialization.jsonObject(with: Data(contentsOf: batchRoot.appendingPathComponent("batch-manifest.json"))) as! [String: Any]
@@ -98,14 +119,14 @@ import Foundation
             try expect(try Data(contentsOf: folder.appendingPathComponent("scene-location.json")) == locationData, "location not exported")
             try expect(fm.fileExists(atPath: folder.appendingPathComponent("depth").path) == (item["sceneID"] as? String == "scan_test"), "per-scene LiDAR policy")
         }
-        let noDepth = try await BetaSceneArchive.shared.saveBatch(entries: entries, includeLiDAR: false)
+        let noDepth = try await BetaSceneArchive.shared.saveBatch(entries: entries, includeLiDAR: false, contents: .original)
         try unpack(noDepth, to: root.appendingPathComponent("batch-rgb"))
         try expect(!(fm.enumerator(atPath: root.appendingPathComponent("batch-rgb").path)?.allObjects as? [String] ?? []).contains { $0.hasSuffix(".f32") }, "RGB batch leaked depth")
         try expect(BetaSceneArchive.safeFolderName("../") == "_", "unsafe filename")
         try expect(BetaSceneArchive.safeFolderName(String(repeating: "🏳️‍🌈", count: 80)).utf8.count <= 180, "UTF8 filename limit")
         let exportsBefore = try fm.contentsOfDirectory(atPath: scene.deletingLastPathComponent().appendingPathComponent("exports").path).count
         try fm.removeItem(at: second.appendingPathComponent("color.mov"))
-        do { _ = try await BetaSceneArchive.shared.saveBatch(entries: entries, includeLiDAR: true); throw NSError(domain: "partial batch published", code: 1) }
+        do { _ = try await BetaSceneArchive.shared.saveBatch(entries: entries, includeLiDAR: true, contents: .original); throw NSError(domain: "partial batch published", code: 1) }
         catch is BetaSceneArchive.ArchiveError { }
         try expect(try fm.contentsOfDirectory(atPath: scene.deletingLastPathComponent().appendingPathComponent("exports").path).count == exportsBefore, "failed batch published a ZIP")
         let secondEntry = try await library.entry(at: second)
@@ -114,11 +135,11 @@ import Foundation
         try expect(try Data(contentsOf: scene.appendingPathComponent("poses.jsonl")) == poses, "rename/batch changed source poses")
         metadata.streamCapture?.status = "failed"
         try JSONEncoder().encode(metadata).write(to: scene.appendingPathComponent("capture-meta.json"), options: .atomic)
-        do { _ = try await BetaSceneArchive.shared.save(directory: scene, includeLiDAR: false); throw NSError(domain: "accepted failed recording", code: 1) }
+        do { _ = try await BetaSceneArchive.shared.save(directory: scene, includeLiDAR: false, contents: .original); throw NSError(domain: "accepted failed recording", code: 1) }
         catch is BetaSceneArchive.ArchiveError { }
         try meta.write(to: scene.appendingPathComponent("capture-meta.json"), options: .atomic)
         try fm.removeItem(at: scene.appendingPathComponent("images/frame.jpg"))
-        do { _ = try await BetaSceneArchive.shared.save(directory: scene, includeLiDAR: false); throw NSError(domain: "accepted missing frame", code: 1) }
+        do { _ = try await BetaSceneArchive.shared.save(directory: scene, includeLiDAR: false, contents: .original); throw NSError(domain: "accepted missing frame", code: 1) }
         catch is BetaSceneArchive.ArchiveError { }
         try expect(!fm.contentsOfDirectory(atPath: scene.deletingLastPathComponent().path).contains(where: { $0.hasPrefix(".beta-export-") }), "staging leak")
         // Exercise ZIP64 end records and the ZIP64 local-offset extra without multi-GB fixtures.

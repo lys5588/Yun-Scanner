@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 // Copyright 2026. See LICENSE and NOTICE.
 import Foundation
+import CryptoKit
 
 /// Serializes exports, stages every change, and never edits capture source files.
 actor BetaSceneArchive {
     static let shared = BetaSceneArchive()
+    enum Contents: String, Sendable { case reconstruction, original }
     struct ArchiveError: LocalizedError {
         let message: String
         var errorDescription: String? { message }
     }
-    func save(directory: URL, includeLiDAR: Bool) throws -> URL {
+    func save(directory: URL, includeLiDAR: Bool, contents: Contents = .reconstruction) throws -> URL {
         let fm = FileManager.default
         let parent = directory.deletingLastPathComponent()
         let staging = parent.appendingPathComponent(".beta-export-" + UUID().uuidString, isDirectory: true)
@@ -17,12 +19,12 @@ actor BetaSceneArchive {
         let name = SceneInfo.read(in: directory)?.name
         let folder = name.map(Self.safeFolderName) ?? directory.lastPathComponent
         let mirror = staging.appendingPathComponent(folder, isDirectory: true)
-        try stage(directory: directory, to: mirror, includeLiDAR: includeLiDAR)
-        return try publish(mirror: mirror, parent: parent, name: folder)
+        try stage(directory: directory, to: mirror, includeLiDAR: includeLiDAR, contents: contents)
+        return try publish(mirror: mirror, parent: parent, name: folder + "-" + contents.rawValue)
     }
 
     /// One ZIP with one named folder per scene. No nested scene ZIPs and no partial success.
-    func saveBatch(entries: [ScanEntry], includeLiDAR: Bool) throws -> URL {
+    func saveBatch(entries: [ScanEntry], includeLiDAR: Bool, contents: Contents = .reconstruction) throws -> URL {
         let fm = FileManager.default
         guard let first = entries.first else { throw ArchiveError(message: L10n.text("请先选择场景。")) }
         let parent = first.directory.deletingLastPathComponent().standardizedFileURL.resolvingSymlinksInPath()
@@ -48,13 +50,13 @@ actor BetaSceneArchive {
                 folder = base + " (\(suffix))"; suffix += 1
             }
             let depth = includeLiDAR && entry.usedLiDAR == true
-            do { try stage(directory: entry.directory, to: batch.appendingPathComponent(folder), includeLiDAR: depth) }
+            do { try stage(directory: entry.directory, to: batch.appendingPathComponent(folder), includeLiDAR: depth, contents: contents) }
             catch { throw ArchiveError(message: entry.displayName + ": " + error.localizedDescription) }
             index.append(["sceneID": entry.id, "sceneName": entry.displayName, "folder": folder, "includesLiDAR": depth])
         }
-        try JSONSerialization.data(withJSONObject: ["schemaVersion": 1, "kind": "beta-capture-batch", "scenes": index], options: [.prettyPrinted, .sortedKeys])
+        try JSONSerialization.data(withJSONObject: ["schemaVersion": 2, "kind": "beta-scene-batch", "contents": contents.rawValue, "scenes": index], options: [.prettyPrinted, .sortedKeys])
             .write(to: batch.appendingPathComponent("batch-manifest.json"), options: .atomic)
-        return try publish(mirror: batch, parent: parent, name: "Scenes")
+        return try publish(mirror: batch, parent: parent, name: "Scenes-" + contents.rawValue)
     }
 
     nonisolated static func safeFolderName(_ name: String) -> String {
@@ -166,7 +168,14 @@ actor BetaSceneArchive {
         try file.synchronize()
     }
 
-    private func stage(directory: URL, to mirror: URL, includeLiDAR: Bool) throws {
+    private func stage(directory: URL, to mirror: URL, includeLiDAR: Bool, contents: Contents) throws {
+        if contents == .reconstruction {
+            try BetaReconstructionExport.stage(directory: directory, to: mirror, includeLiDAR: includeLiDAR)
+        } else {
+            try stageOriginal(directory: directory, to: mirror, includeLiDAR: includeLiDAR)
+        }
+    }
+    private func stageOriginal(directory: URL, to mirror: URL, includeLiDAR: Bool) throws {
         let fm = FileManager.default
         let records = ScanLibrary.savedRecords(in: directory).0
         guard !records.isEmpty, records.allSatisfy({ record in
@@ -197,6 +206,7 @@ actor BetaSceneArchive {
             }
         }
         var excluded: Set<String> = [ExportManager.gaussianTrainingFolder]
+        excluded.formUnion(contents.filter { $0.lastPathComponent.hasPrefix(".camera-estimation-") }.map(\.lastPathComponent))
         if !includeLiDAR {
             excluded.formUnion(["depth", "worldmap.arexperience", "worldmap.bin"])
             // Photogrammetry points are RGB evidence; preserve their provenance references.
@@ -217,8 +227,8 @@ actor BetaSceneArchive {
                     .write(to: url, options: .atomic)
             }
         }
-        let manifest: [String: Any] = [
-            "schemaVersion": 2, "kind": "beta-capture-scene", "sceneID": directory.lastPathComponent,
+        var manifest: [String: Any] = [
+            "schemaVersion": 3, "kind": "beta-capture-scene", "sceneID": directory.lastPathComponent,
             "sceneName": SceneInfo.read(in: directory)?.name ?? directory.lastPathComponent,
             "locationFile": SceneLocation.read(in: directory) == nil ? NSNull() : "scene-location.json",
             "includesLiDAR": includeLiDAR, "imagesDirectory": "images", "poseFile": "poses.jsonl",
@@ -227,6 +237,20 @@ actor BetaSceneArchive {
                 ? "photogrammetry_arbitrary_scale" : "arkit_metric",
             "exportedAt": ISO8601DateFormatter().string(from: Date())
         ]
+        if let data = try? Data(contentsOf: mirror.appendingPathComponent("camera-estimation.json")),
+           let report = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+            // Removing depth from an export does not undo its contribution to an estimate.
+            // poses.jsonl is sanitized in that export, so retain both provenance hashes.
+            let exported = try Data(contentsOf: mirror.appendingPathComponent("poses.jsonl"))
+            manifest["cameraEstimation"] = [
+                "reportFile": "camera-estimation.json", "status": report["status"] ?? "unknown",
+                "cameraFile": report["cameraFile"] ?? NSNull(),
+                "usedDepthInput": !(report["depthFrameIDs"] as? [Int] ?? []).isEmpty,
+                "sourcePosesSHA256BeforeExport": report["sourcePosesSHA256"] ?? NSNull(),
+                "exportedPosesSHA256": SHA256.hash(data: exported).map { String(format: "%02x", $0) }.joined(),
+                "originalCameraFile": "poses.jsonl", "separateEstimates": true
+            ]
+        }
         try JSONSerialization.data(withJSONObject: manifest, options: [.prettyPrinted, .sortedKeys])
             .write(to: mirror.appendingPathComponent("scene-package.json"), options: .atomic)
     }
