@@ -962,3 +962,11 @@
 "仅包含有效图像与对应相机参数；原视频与未筛选点云保留在原始归档中。" = "Includes valid images and their camera parameters. Original videos and unfiltered point clouds remain in the original archive.";
 "保存重建结果 ZIP" = "Save reconstruction ZIP";
 "保存原始归档 ZIP" = "Save original archive ZIP";
+
+"RealityKit 已返回结果，但坐标配准未完成。请重新估计相机参数；原始结果仍保留。" = "RealityKit returned results, but coordinate registration is incomplete. Re-estimate camera parameters; original results are preserved.";
+
+"配准后位置差中位数：%@ cm" = "Median position difference after registration: %@ cm";
+
+"差值用于比较两套估计，不代表真实误差或拍摄抖动。" = "This compares the two estimates; it does not measure absolute error or camera shake.";
+
+"重建包分文件夹保存两套参数，默认使用 RealityKit；当前预览和训练仍使用 ARKit。" = "The reconstruction package saves both camera sets in separate folders and defaults to RealityKit. Preview and training still use ARKit.";

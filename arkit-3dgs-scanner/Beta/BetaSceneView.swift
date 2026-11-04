@@ -66,6 +66,7 @@ struct BetaSceneView: View {
                         }
                     } else if let player {
                         VideoPlayer(player: player).frame(height: 260).clipShape(RoundedRectangle(cornerRadius: 22))
+                            .accessibilityIdentifier("betaSceneVideo")
                     }
                     HStack(spacing: 22) {
                         metric("\(preview.images.count)", L10n.text("帧"))
@@ -90,6 +91,12 @@ struct BetaSceneView: View {
                         VStack(alignment: .leading, spacing: 10) {
                             Text(L10n.text("摄影测量相机参数")).font(.headline)
                             Text(cameraEstimationNotice).font(.caption).foregroundStyle(.secondary)
+                            if let alignment = cameraReport?.alignment {
+                                Text(L10n.text("配准后位置差中位数：\(String(format: "%.2f", alignment.medianPositionErrorMeters * 100)) cm"))
+                                    .font(.caption.monospacedDigit())
+                                Text(L10n.text("差值用于比较两套估计，不代表真实误差或拍摄抖动。"))
+                                    .font(.caption).foregroundStyle(.secondary)
+                            }
                             if estimating {
                                 ProgressView(value: estimationProgress)
                                 Text(L10n.text("RealityKit 相机估计需要保持 App 在前台。"))
@@ -192,7 +199,7 @@ struct BetaSceneView: View {
             preview = try await ScanLibrary.beta.preview(found)
             let files = try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)
             if let movie = files.first(where: { ["mov", "mp4", "m4v"].contains($0.pathExtension.lowercased()) }) {
-                player = AVPlayer(url: movie)
+                player = try await BetaVideoPreview.player(movie: movie, directory: directory, isVideoImport: found.isVideoImport)
             }
         } catch { self.error = error.localizedDescription }
     }
@@ -211,7 +218,9 @@ struct BetaSceneView: View {
         switch report.status {
         case "estimated_aligned":
             return L10n.text("已估计并对齐 \(report.estimatedFrameCount) / \(report.inputFrameCount) 张关键帧；原始参数已保留。")
+                + "\n" + L10n.text("重建包分文件夹保存两套参数，默认使用 RealityKit；当前预览和训练仍使用 ARKit。")
                 + "\n" + L10n.text("这些结果尚未通过独立精度验证。")
+        case "alignment_rejected": return L10n.text("RealityKit 已返回结果，但坐标配准未完成。请重新估计相机参数；原始结果仍保留。")
         case "unsupported": return L10n.text("设备不支持摄影测量，保留原始 ARKit 参数。")
         case "insufficient_frames": return L10n.text("关键帧不足，摄影测量至少需要 8 张图像。")
         case "too_many_frames": return L10n.text("关键帧超出当前设备处理上限，原始参数已保留。")

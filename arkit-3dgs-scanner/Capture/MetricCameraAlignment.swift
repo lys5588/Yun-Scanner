@@ -21,6 +21,8 @@ nonisolated enum MetricCameraAlignment {
         var p90PositionErrorMeters: Double
         var medianRotationErrorDegrees: Double
         var referenceRadiusMeters: Double
+        // Optional for decoding reports written before the diagnostic-only policy.
+        var warnings: [String]?
         var rotation: simd_double3x3 {
             simd_double3x3(columns: (SIMD3(rotationRowMajor[0], rotationRowMajor[3], rotationRowMajor[6]),
                                     SIMD3(rotationRowMajor[1], rotationRowMajor[4], rotationRowMajor[7]),
@@ -102,13 +104,18 @@ nonisolated enum MetricCameraAlignment {
             selected = kept
         }
         var result = try fit(selected)
-        let residuals = selected.map { errors($0, result) }
+        // Report disagreement over every correspondence, including those excluded
+        // from the robust fit. Neither trajectory is an accuracy ground truth.
+        let residuals = pairs.map { errors($0, result) }
         result.medianPositionErrorMeters = quantile(residuals.map { $0.0 })
         result.p90PositionErrorMeters = quantile(residuals.map { $0.0 }, 0.9)
         result.medianRotationErrorDegrees = quantile(residuals.map { $0.1 })
-        guard result.medianPositionErrorMeters <= max(0.03, 0.03*result.referenceRadiusMeters),
-              result.p90PositionErrorMeters <= max(0.08, 0.08*result.referenceRadiusMeters),
-              result.medianRotationErrorDegrees <= 5 else { throw Failure.inconsistentTrajectories }
+        result.warnings = []
+        if result.medianPositionErrorMeters > max(0.03, 0.03*result.referenceRadiusMeters) ||
+            result.p90PositionErrorMeters > max(0.08, 0.08*result.referenceRadiusMeters) ||
+            result.medianRotationErrorDegrees > 5 {
+            result.warnings = ["trajectory_disagreement_not_accuracy_failure"]
+        }
         result.inlierIDs = selected.map(\.id)
         let ids = Set(result.inlierIDs)
         result.rejectedIDs = pairs.filter { !ids.contains($0.id) }.map(\.id)
