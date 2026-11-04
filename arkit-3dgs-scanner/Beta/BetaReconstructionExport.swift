@@ -116,6 +116,7 @@ nonisolated enum BetaReconstructionExport {
         let originals = try rows(sourceData)
         guard !originals.isEmpty else { throw fail(L10n.text("没有可导出的有效帧。")) }
         var estimated: [Int: [String: Any]] = [:], stream: [Double: [String: Any]] = [:]
+        var nativeEstimated: [Int: [String: Any]] = [:]
         var report: [String: Any] = [:]
         var rejectedIDs = Set<Int>(), droppedIDs: [Int] = []
         var sourceHashes: [String: String] = ["poses.jsonl":hash(sourceData)]
@@ -134,8 +135,15 @@ nonisolated enum BetaReconstructionExport {
             }
             let state = try json(file("capture-processing.json",in:directory))
             guard state["status"] as? String == "completed" else { throw fail(L10n.text("采集未完成，请保留原始数据并重试。")) }
-            guard let value = try? json(file("camera-estimation.json",in:directory)), value["status"] as? String == "estimated_aligned",
-                  value["sourcePosesSHA256"] as? String == hash(sourceData), let cameraFile = value["cameraFile"] as? String else {
+            guard let value = try? json(file("camera-estimation.json",in:directory)) else {
+                throw fail(L10n.text("请先完成相机估计与米制配准，或选择原始归档。"))
+            }
+            if value["status"] as? String == "alignment_rejected" {
+                throw fail(L10n.text("RealityKit 已返回结果，但坐标配准未完成。请重新估计相机参数；原始结果仍保留。"))
+            }
+            guard value["status"] as? String == "estimated_aligned",
+                  value["sourcePosesSHA256"] as? String == hash(sourceData), let cameraFile = value["cameraFile"] as? String,
+                  let rawCameraFile = value["rawCameraFile"] as? String else {
                 throw fail(L10n.text("请先完成相机估计与米制配准，或选择原始归档。"))
             }
             report = value
@@ -147,8 +155,15 @@ nonisolated enum BetaReconstructionExport {
             }
             guard report["estimatedFrameCount"] as? Int == estimated.count else { throw fail("estimated count mismatch") }
             guard let inliers = (report["alignment"] as? [String: Any])?["inlierIDs"] as? [Int],
-                  Set(inliers) == Set(estimated.keys), Set(inliers).isDisjoint(with:rejectedIDs),
+                  inliers.count == Set(inliers).count, Set(inliers).isDisjoint(with:rejectedIDs),
                   report["worldCoordinates"] as? String == "original ARKit world, meters, gravity-aligned Y-up" else { throw fail("alignment membership or coordinates mismatch") }
+            let fitOnly = report["alignmentPolicy"] as? String == "global_similarity_fit_outliers_retained"
+            guard (fitOnly ? Set(inliers).union(rejectedIDs) : Set(inliers)) == Set(estimated.keys) else { throw fail("alignment membership mismatch") }
+            let nativeData = try Data(contentsOf:file(rawCameraFile,in:directory)); sourceHashes[rawCameraFile] = hash(nativeData)
+            guard let nativeRows = try JSONSerialization.jsonObject(with:nativeData) as? [[String: Any]] else { throw fail("invalid native cameras") }
+            for row in nativeRows {
+                guard let id = row["sampleID"] as? Int, nativeEstimated.updateValue(row,forKey:id) == nil else { throw fail("duplicate native camera ID") }
+            }
             let data = try Data(contentsOf:file("frames.jsonl",in:directory)); sourceHashes["frames.jsonl"] = hash(data)
             var frameIDs = Set<Int>()
             for row in try rows(data) {
@@ -178,6 +193,7 @@ nonisolated enum BetaReconstructionExport {
                 guard candidate["imageFile"] as? String == name, candidate["timestamp"] as? Double == time,
                       validCamera(candidate), let targetK = calibration(candidate["intrinsics"]), targetK.width == k.width, targetK.height == k.height,
                       let originalK = calibration(candidate["originalIntrinsics"]), originalK.fx == k.fx, originalK.fy == k.fy, originalK.cx == k.cx, originalK.cy == k.cy, originalK.width == k.width, originalK.height == k.height,
+                      let native = nativeEstimated[id], native["imageFile"] as? String == name, native["timestamp"] as? Double == time,
                       frame["transform"] as? [Double] == row["transform"] as? [Double],
                       let streamK = calibration(frame["intrinsics"]), streamK.fx == k.fx, streamK.fy == k.fy, streamK.cx == k.cx, streamK.cy == k.cy, streamK.width == k.width, streamK.height == k.height else { reject("camera_correspondence_invalid"); continue }
                 camera = candidate; linkedFrame["sourceFrameID"] = frame["frameID"]
@@ -189,7 +205,7 @@ nonisolated enum BetaReconstructionExport {
                     let path = "depth/" + (row[key] as! String); linkedFrame[key] = path; copies.append(path)
                 }
                 linkedFrame["depthWidth"] = row["depthWidth"]; linkedFrame["depthHeight"] = row["depthHeight"]
-                linkedFrame["depthCalibrationPoseFile"] = "poses-arkit.jsonl"
+                linkedFrame["depthCalibrationPoseFile"] = "arkit/poses.jsonl"
             }
             var original = addExtrinsics(row)
             // Depth references live only in frames.jsonl, with an explicit native calibration.
@@ -202,23 +218,41 @@ nonisolated enum BetaReconstructionExport {
         guard isVideo || Set(estimated.keys).isSubset(of:ids) else { throw fail("unknown estimated camera") }
         try fm.createDirectory(at:destination,withIntermediateDirectories:true)
         for path in Set(copies).sorted() { try Task.checkCancellation(); try copy(path,from:directory,to:destination) }
-        let poseFile = isVideo ? "poses.jsonl" : "poses-realitykit.jsonl"
+        let poseFile = isVideo ? "poses.jsonl" : "realitykit/poses.jsonl"
+        if !isVideo {
+            for folder in ["arkit","realitykit"] { try fm.createDirectory(at:destination.appendingPathComponent(folder),withIntermediateDirectories:true) }
+            try writeRows(arkitRows,to:destination.appendingPathComponent("arkit/poses.jsonl"))
+            try write(accepted.map { nativeEstimated[$0]! },to:destination.appendingPathComponent("realitykit/native-cameras.json"))
+            let alignment: [String: Any] = ["schemaVersion":1,"method":"global_similarity","direction":"realitykit_native_world_to_arkit_world",
+                "scaleReference":"original ARKit camera trajectory","worldCoordinates":report["worldCoordinates"]!,
+                "coordinateAdaptation":report["coordinateAdaptation"] ?? NSNull(),
+                "result":report["alignment"] ?? NSNull(),"appliedTo":"realitykit/poses.jsonl",
+                "transformAlreadyApplied":true,"statisticsScope":"all source correspondences for v2 reports; robust fit subset for v1",
+                "sourceReportSchemaVersion":report["schemaVersion"] ?? 1,
+                "policy":report["alignmentPolicy"] ?? "legacy_inliers_only",
+                "accuracy":"ARKit is a coordinate and scale reference, not ground truth; this is not a ranking of accuracy"]
+            try write(alignment,to:destination.appendingPathComponent("alignment.json"))
+        }
         try writeRows(cameraRows,to:destination.appendingPathComponent(poseFile))
-        if !isVideo { try writeRows(arkitRows,to:destination.appendingPathComponent("poses-arkit.jsonl")) }
         try writeRows(frameRows,to:destination.appendingPathComponent("frames.jsonl"))
         let selection: [String: Any] = ["schemaVersion":1,"acceptedFrameIDs":accepted,"excludedFrames":excluded,
             "droppedContinuousFrameIDs":droppedIDs,"sourceFileSHA256":sourceHashes,
             "inputFrameCount":originals.count,"outputFrameCount":accepted.count,"originalCapturePreserved":true,
             "usedDepthInEstimation":!(report["depthFrameIDs"] as? [Int] ?? []).isEmpty,
             "sourceAlignment":report["alignment"] ?? NSNull(),
-            "policy":isVideo ? "valid prepared camera AND saved image AND keep quality" : "accepted aligned camera AND saved image AND videoWritten AND normal tracking AND keep quality; complete same-frame depth pair when requested"]
+            "policy":isVideo ? "valid prepared camera AND saved image AND keep quality" : "common valid cameras AND saved image AND videoWritten AND normal tracking AND keep quality; complete same-frame depth pair when requested; v2 registration fit exclusions are not frame exclusions"]
         try write(selection,to:destination.appendingPathComponent("selection.json"))
         for path in ["scene-info.json","scene-location.json"] where fm.fileExists(atPath:directory.appendingPathComponent(path).path) {
             try copy(path,from:directory,to:destination)
         }
-        let manifest: [String: Any] = ["schemaVersion":4,"kind":"beta-reconstruction-scene","sceneID":directory.lastPathComponent,
+        let manifest: [String: Any] = ["schemaVersion":5,"kind":"beta-reconstruction-scene","sceneID":directory.lastPathComponent,
             "frameCount":accepted.count,"imagesDirectory":"images","poseFile":poseFile,
-            "arkitPoseFile":isVideo ? NSNull() : "poses-arkit.jsonl","frameFile":"frames.jsonl","selectionFile":"selection.json",
+            "arkitPoseFile":isVideo ? NSNull() : "arkit/poses.jsonl",
+            "realitykitPoseFile":isVideo ? NSNull() : "realitykit/poses.jsonl",
+            "realitykitNativeCameraFile":isVideo ? NSNull() : "realitykit/native-cameras.json",
+            "alignmentFile":isVideo ? NSNull() : "alignment.json",
+            "pathBase":"package_root; imageFile is relative to imagesDirectory",
+            "frameFile":"frames.jsonl","selectionFile":"selection.json",
             "filteredFramesOnly":true,"includesLiDAR":includeLiDAR && !isVideo,"videos":[],"includesUnfilteredPointCloud":false,
             "metricScale":!isVideo,"worldCoordinates":isVideo ? "photogrammetry normalized, arbitrary scale" : "original ARKit world, meters, gravity-aligned Y-up",
             "cameraConvention":"OpenGL c2w row-major; explicit GL/OpenCV w2c",

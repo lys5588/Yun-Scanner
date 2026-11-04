@@ -96,6 +96,16 @@ python3 tools/package_project.py --minimal
 
 ## 3. 当前真实状态
 
+2026-11-04 双相机导出更新（build 13）：重建包升级 schemaVersion=5，`arkit/poses.jsonl` 和 `realitykit/poses.jsonl` 使用相同有效帧、本次 ARKit 米制世界，默认入口指向 RealityKit。`realitykit/native-cameras.json` 保留筛选后未经配准的原始估计，`alignment.json` 保存已应用的全局旋转、平移、尺度和差异。新估计不再以超过 3 cm 等差异阈值拒绝整组结果，稳健拟合外点也保留有效相机；几何退化仍报错。预览和训练输入继续使用原始 ARKit，完整采集保留，未宣称精度改善。格式与兼容规则见 [数据保存格式](docs/数据保存格式.md)。源码/CPU、相机与归档回归、iPhoneOS / Simulator Debug 顺序构建、Release 签名校验通过，原位安装与设备查询确认为 1.0（13）。
+
+用户先前失败的场景 `scan_20261103_231536_7B954E` 已在手机重新估计并实际保存：44 / 48 组相机，48 张同步深度送入估计，ID 28、41、42、43 未返回相机并从最终两套数据共同排除。真机 UI 用例通过（29.279 秒），显示 3.82 cm 的位置差并成功保存；无需重拍。取回的 ZIP 为 17,501,278 字节、140 个文件，含 44 张图像、两套各 44 组参数、44 对深度/置信度及 44 个原始 RealityKit 返回值。CRC、公共 ID、原始 ARKit K/c2w、尺度/轴转换、K 尺寸换算、GL/OpenCV 逆矩阵、深度大小/有效值和所有来源摘要核对通过；源 poses/frames 与失败前字节一致。首个离线摘要检查使用了重新估计前的旧报告，因报告已更新而不匹配；重新取回手机当前源文件后上述全部摘要检查通过。
+
+另外重放第一次采集的已保存相机/点云，新规则保留 57 / 59 个相机（第 4 帧仅不参与变换拟合，仍保留自己的估计）；Mac 导出 25,554,961 字节、179 个文件。旧 v1 报告兼容导出仍保留原有 56 组，并明确 legacy 策略。原始第一次采集的 1,936 个文件与原归档逐字节摘要一致。证据集中在 `.build/dual-camera-export-20261103/`：`DeviceDualCamera.xcresult`、`device-validation.json`、`mac-validation.json`、`legacy-validation.json`、`original-integrity.json` 及构建/回归日志；签名 App 为 `.build/iphone-release/20261104-1.0-b13-dual-camera/`。本轮未进行独立实物标定、精度排名或端侧训练对照。
+
+2026-11-03 场景视频方向修复（build 12）：Beta 预览为原生传感器方向视频建立内存播放组合，依据首帧重力投影选择显示旋转；本次竖屏视频顺时针转回 90°。普通视频导入和已有轨道方向变换沿用自身方向。MOV/JPEG、K/c2w、深度及导出格式保持不变；重力投影不足时回退竖屏显示，拍摄中途转动手机不逐帧校正。原理与限制见 [采集与存储](docs/采集与存储.md)。
+
+源码/CPU 回归、真机与模拟器 Debug 顺序构建、Release 签名校验通过，已原位安装到 iPhone 18 Pro / iOS 27.2，设备查询确认为 1.0（12）。真实视频经实际播放器组合解码，显示从 1920×1440 转为 1440×1920，原 MOV 和 poses 字节未变；导入分支保持原轨道方向。使用用户新拍场景 `scan_20261103_231536_7B954E` 完成真机预览及播放/暂停复查（14.460 秒），截图确认沙发、窗帘与系统播放控件正向。首条自动化因系统播放按钮未出现在可访问性树中而失败；依据实际界面点按并保存截图的复查通过，首条失败记录保留。证据在 `.build/beta-video-orientation-20261103/`（`verify.log`、`DeviceVideoOrientation.xcresult`、`DeviceVideoPlayback.xcresult`、`playback-attachments/`），签名 App 位于 `.build/iphone-release/20261103-1.0-b12-video-orientation/`。本次没有改动相机估计或配准阈值。
+
 2026-11-03 筛选导出更新（build 11）：Beta 单个/批量保存默认生成“重建结果”包；完整视频、连续索引及全部原始/估计资料通过“原始归档”单独保存。有效帧必须同时有正常跟踪、未丢失的视频帧、有效图像、原始参数和通过米制配准的估计参数；包含 LiDAR 时还要求有效且同帧的深度/置信度。两套相机、图像和可选深度共享同一 ID 名单，不补造缺失结果；失败或零有效帧不回退为原始包。预览及训练输入暂不变，数据格式见 [采集与存储](docs/采集与存储.md)。
 
 已用刚才的真实手机场景在 Mac 回放实际导出代码：最终 ZIP 为 24,644,207 字节、174 个文件，含 56 张图像、两套各 56 组相机、56 对深度/置信度；ID 1、3 缺失估计，ID 4 配准拒绝，19 条连续丢帧仅留审计记录。CRC、同一 ID 集合、原始 K/c2w、逆矩阵、媒体字节、来源摘要及 1,936 个原始文件未变均通过。筛选/归档 CPU 回归、25 项本地化检查、项目检查及顺序执行的 iPhoneOS / iPhoneSimulator Debug 构建通过。测试日志在 `.build/beta-tests/filtered-*`，真实导出与校验在 `.build/metric-camera-device-20261103/exported/exports/`、`filtered-export-validation.json`。

@@ -12,7 +12,8 @@ import UIKit
 nonisolated enum CapturePhotogrammetry {
     static let reportName = "camera-estimation.json"
     struct Report: Codable, Sendable {
-        var schemaVersion = 1
+        var schemaVersion = 2
+        var alignmentPolicy: String? = "global_similarity_fit_outliers_retained"
         var method = "RealityKit.PhotogrammetrySession"
         var status = "processing"
         var reason: String?
@@ -34,7 +35,7 @@ nonisolated enum CapturePhotogrammetry {
         var worldCoordinates = "original ARKit world, meters, gravity-aligned Y-up"
         var cameraConvention = "OpenGL camera-to-world, row-major"
         var scaleReference = "original ARKit camera trajectory"
-        var accuracy = "Coordinate consistency checked; no claim of improved calibration or independent metric accuracy"
+        var accuracy = "Global coordinate registration only; disagreement is diagnostic, not an accuracy verdict"
         var depthPolicy = "same-frame metric depth; confidence below medium masked as NaN; resized to sample pixels"
         var projectionChecks: [VideoPhotogrammetry.CandidateScore]?
     }
@@ -322,15 +323,23 @@ nonisolated enum CapturePhotogrammetry {
                let alignment = try? MetricCameraAlignment.solve(pairs) { candidates.append((flip,pairs,alignment)) }
         }
         if candidates.count == 2 {
-            let preferred = try VideoPhotogrammetry.chooseConvention(poses:usable,points:points).0
+            // A surrounding room can project in both directions. A varying 180°
+            // local-axis error cannot be absorbed by one world rotation. Use that
+            // distinction to resolve conventions, never to discard individual poses.
+            let ordered = candidates.sorted { $0.alignment.medianRotationErrorDegrees < $1.alignment.medianRotationErrorDegrees }
+            let preferred: Bool
+            if ordered[1].alignment.medianRotationErrorDegrees - ordered[0].alignment.medianRotationErrorDegrees > 5 {
+                preferred = ordered[0].flip
+            } else {
+                preferred = try VideoPhotogrammetry.chooseConvention(poses:usable,points:points).0
+            }
             candidates.removeAll { $0.flip != preferred }
         }
-        guard let selected = candidates.first else { throw Failure.processing("no camera-axis interpretation agrees with original ARKit trajectory") }
+        guard let selected = candidates.first else { throw Failure.processing("cannot establish camera convention and a nondegenerate global metric transform") }
         let pairs = selected.pairs, alignment = selected.alignment
-        let inliers = Set(alignment.inlierIDs)
         let rawByID = Dictionary(uniqueKeysWithValues:raw.map { ($0.sampleID,$0) })
         let pairByID = Dictionary(uniqueKeysWithValues:pairs.map { ($0.id,$0) })
-        let cameras = usable.filter { inliers.contains($0.sampleID) }.map { p -> Camera in
+        let cameras = usable.map { p -> Camera in
             let input = byID[p.sampleID]!, record = input.record
             let sx = Double(record.intrinsics.width)/Double(input.width), sy = Double(record.intrinsics.height)/Double(input.height)
             let k = CameraIntrinsics(fx:Double(p.intrinsics[0][0])*sx,fy:Double(p.intrinsics[1][1])*sy,

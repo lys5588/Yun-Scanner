@@ -58,13 +58,14 @@ enum BetaFilteredExportTests {
                 "videoWritten":true,"trackingState":"normal","depthFile":"depth/continuous/\(id).f32",
                 "confidenceFile":"depth/continuous/\(id).u8","depthWidth":4,"depthHeight":3]
             var camera = row; camera["originalIntrinsics"] = k
+            if id == 5 { var different = matrix; different[3] += 3; camera["transform"] = different }
             if id == 3 { frame["videoWritten"] = false; frame["dropReason"] = "media_backpressure" }
             if id == 6 { frame["trackingState"] = "limited" }
             if id == 10 { row["blurVerdict"] = "demote" }
             if id == 11 { camera["timestamp"] = 0.0 }
             if id == 12 { row["transform"] = [Double](repeating:0,count:16) }
             originals.append(row); frames.append(frame)
-            if id != 4 && id != 5 { cameras.append(camera) }
+            if id != 4 { cameras.append(camera) }
             try (id == 7 ? Data("bad JPEG".utf8) : pixels).write(to:scene.appendingPathComponent("images/\(id).jpg"))
             for prefix in ["depth/","depth/continuous/"] {
                 try depth.write(to:scene.appendingPathComponent(prefix+"\(id).f32"))
@@ -76,42 +77,56 @@ enum BetaFilteredExportTests {
         try rows(originals,scene.appendingPathComponent("poses.jsonl")); try rows(frames,scene.appendingPathComponent("frames.jsonl"))
         try rows(cameras,scene.appendingPathComponent("camera-estimation/test/cameras.jsonl"))
         try pixels.write(to:scene.appendingPathComponent("images/unselected.jpg"))
-        for path in ["color.mov","points.ply","camera-estimation/test/raw-cameras.json"] {
+        for path in ["color.mov","points.ply"] {
             try Data("original-only payload".utf8).write(to:scene.appendingPathComponent(path))
         }
+        let native: [[String: Any]] = cameras.map { camera in
+            ["sampleID":camera["id"]!,"imageFile":camera["imageFile"]!,"timestamp":camera["timestamp"]!,
+             "transformColumnMajor":(0..<4).flatMap { c in (0..<4).map { r in (camera["transform"] as! [Double])[r*4+c] } }]
+        }
+        try json(native,scene.appendingPathComponent("camera-estimation/test/raw-cameras.json"))
         var stream = StreamCaptureMeta(); stream.status = "complete"; stream.videoSegments = ["color.mov"]
         let meta = SessionMeta(device:"fixture",osVersion:"fixture",startedAt:"2026-11-03T00:00:00Z",mode:"scene",lidarAvailable:true,lidarEnabled:true,streamCapture:stream)
         try JSONEncoder().encode(meta).write(to:scene.appendingPathComponent("capture-meta.json"))
         try json(["status":"completed"],scene.appendingPathComponent("capture-processing.json"))
         let reportURL = scene.appendingPathComponent("camera-estimation.json")
-        var report: [String: Any] = ["status":"estimated_aligned","cameraFile":"camera-estimation/test/cameras.jsonl",
+        var report: [String: Any] = ["schemaVersion":2,"alignmentPolicy":"global_similarity_fit_outliers_retained",
+            "status":"estimated_aligned","cameraFile":"camera-estimation/test/cameras.jsonl","rawCameraFile":"camera-estimation/test/raw-cameras.json",
             "estimatedFrameCount":cameras.count,"sourcePosesSHA256":try hash(scene.appendingPathComponent("poses.jsonl")),
             "worldCoordinates":"original ARKit world, meters, gravity-aligned Y-up",
-            "alignment":["inlierIDs":cameras.map { $0["id"] as! Int },"rejectedIDs":[5]],"depthFrameIDs":Array(1...12)]
+            "alignment":["inlierIDs":cameras.map { $0["id"] as! Int }.filter { $0 != 5 },"rejectedIDs":[5]],"depthFrameIDs":Array(1...12)]
         try json(report,reportURL)
         let before = try hashes(scene)
         let zip = try await BetaSceneArchive.shared.save(directory:scene,includeLiDAR:true)
         try BetaSceneTests.unpack(zip,to:root.appendingPathComponent("unpacked"))
         let output = root.appendingPathComponent("unpacked/scan_policy")
-        for path in ["poses-arkit.jsonl","poses-realitykit.jsonl","frames.jsonl"] {
-            try check(try readRows(output.appendingPathComponent(path)).map { $0["id"] as! Int } == [1,2],"common accepted frame IDs: "+path)
+        for path in ["arkit/poses.jsonl","realitykit/poses.jsonl","frames.jsonl"] {
+            try check(try readRows(output.appendingPathComponent(path)).map { $0["id"] as! Int } == [1,2,5],"common accepted frame IDs: "+path)
         }
+        let outputNative = try JSONSerialization.jsonObject(with:Data(contentsOf:output.appendingPathComponent("realitykit/native-cameras.json"))) as! [[String: Any]]
+        try check(outputNative.map { $0["sampleID"] as! Int } == [1,2,5],"native cameras must use the same filtered IDs")
+        let ark = try readRows(output.appendingPathComponent("arkit/poses.jsonl")).last!["transform"] as! [Double]
+        let rk = try readRows(output.appendingPathComponent("realitykit/poses.jsonl")).last!["transform"] as! [Double]
+        try check(abs(rk[3]-ark[3]-3) < 1e-8,"registration outlier retained without snapping to ARKit")
+        let manifest = try read(output.appendingPathComponent("scene-package.json"))
+        try check(manifest["schemaVersion"] as? Int == 5 && manifest["poseFile"] as? String == "realitykit/poses.jsonl","dual-folder manifest")
+        try check(try read(output.appendingPathComponent("alignment.json"))["transformAlreadyApplied"] as? Bool == true,"prevent double transform")
         let selection = try read(output.appendingPathComponent("selection.json"))
         let excluded = selection["excludedFrames"] as! [[String: Any]]
         let reasons = Dictionary(uniqueKeysWithValues:excluded.map { ($0["id"] as! Int,$0["reason"] as! String) })
-        try check(reasons == [3:"video_frame_dropped",4:"photogrammetry_missing",5:"alignment_rejected",6:"tracking_not_normal",
+        try check(reasons == [3:"video_frame_dropped",4:"photogrammetry_missing",6:"tracking_not_normal",
             7:"image_missing_or_invalid",8:"depth_missing_or_invalid",9:"depth_missing_or_invalid",10:"quality_rejected",
             11:"camera_correspondence_invalid",12:"invalid_arkit_or_source_camera"],"rejection reasons")
         try check(selection["droppedContinuousFrameIDs"] as? [Int] == [30],"drop audit")
-        try check(Set(try fm.contentsOfDirectory(atPath:output.path)) == Set(["images","depth","poses-arkit.jsonl","poses-realitykit.jsonl","frames.jsonl","selection.json","scene-package.json"]),"allowlist excludes raw data")
-        try check(try fm.contentsOfDirectory(atPath:output.appendingPathComponent("images").path).count == 2,"rejected image leaked")
-        try check(try fm.contentsOfDirectory(atPath:output.appendingPathComponent("depth").path).count == 4,"rejected depth leaked")
+        try check(Set(try fm.contentsOfDirectory(atPath:output.path)) == Set(["images","depth","arkit","realitykit","alignment.json","frames.jsonl","selection.json","scene-package.json"]),"allowlist excludes unfiltered data")
+        try check(try fm.contentsOfDirectory(atPath:output.appendingPathComponent("images").path).count == 3,"rejected image leaked")
+        try check(try fm.contentsOfDirectory(atPath:output.appendingPathComponent("depth").path).count == 6,"rejected depth leaked")
         try check(try hashes(scene) == before,"export modified original data")
         let rgb = try await BetaSceneArchive.shared.save(directory:scene,includeLiDAR:false)
         try BetaSceneTests.unpack(rgb,to:root.appendingPathComponent("rgb"))
         let rgbOutput = root.appendingPathComponent("rgb/scan_policy")
         try check(!fm.fileExists(atPath:rgbOutput.appendingPathComponent("depth").path),"depth leaked into RGB-only export")
-        for path in ["poses-arkit.jsonl","poses-realitykit.jsonl","frames.jsonl"] {
+        for path in ["arkit/poses.jsonl","realitykit/poses.jsonl","frames.jsonl"] {
             let text = try String(contentsOf:rgbOutput.appendingPathComponent(path),encoding:.utf8)
             try check(!text.contains("depthFile") && !text.contains("confidenceFile"),"dangling depth reference")
         }
@@ -150,7 +165,7 @@ enum BetaFilteredExportTests {
         let videoOutput = root.appendingPathComponent("video/scan_video")
         let videoManifest = try read(videoOutput.appendingPathComponent("scene-package.json"))
         try check(videoManifest["metricScale"] as? Bool == false && videoManifest["poseFile"] as? String == "poses.jsonl","video scale/camera semantics")
-        try check(!fm.fileExists(atPath:videoOutput.appendingPathComponent("poses-arkit.jsonl").path),"invented ARKit parameters")
+        try check(!fm.fileExists(atPath:videoOutput.appendingPathComponent("arkit").path),"invented ARKit parameters")
 
         // Valid reports with no surviving frames cannot fall back to original capture.
         for i in originals.indices { originals[i]["blurVerdict"] = "reject" }

@@ -49,7 +49,9 @@ private func selfTest() async throws {
     try rejects("stationary trajectory") { _ = try MetricCameraAlignment.solve(still) }
     var inconsistent = pairs
     for i in inconsistent.indices { inconsistent[i].reference.columns.3.y += i % 2 == 0 ? 0.3 : -0.3 }
-    try rejects("inconsistent path") { _ = try MetricCameraAlignment.solve(inconsistent) }
+    let disagreement = try MetricCameraAlignment.solve(inconsistent)
+    try check(disagreement.medianPositionErrorMeters > 0.03 && disagreement.warnings?.contains("trajectory_disagreement_not_accuracy_failure") == true,
+              "large disagreement is diagnostic, not proof RealityKit is wrong")
     var reflection = matrix_identity_double4x4; reflection[0][0] = -1
     try check(!MetricCameraAlignment.valid(reflection), "reflection is not a camera rotation")
     print("PASS metric registration, rigid cameras, outlier and degeneracy rejection")
@@ -72,6 +74,13 @@ private func selfTest() async throws {
         try check(simd_length(w2c*world-local) < 1e-8, "w2c inverse")
         try check(simd_length(cv*world-SIMD4(0.1,-0.2,2,1)) < 1e-8, "OpenCV conversion exactly once")
     }
+    var fitInputs = inputs
+    fitInputs[11] = .init(record:frame(11,outliers[11].reference),image:inputs[11].image,depth:nil,confidence:nil,width:100,height:100)
+    let retained = try CapturePhotogrammetry.align(raw:raw,points:points,inputs:fitInputs)
+    try check(retained.alignment.rejectedIDs == [11] && retained.cameras.count == 12,
+              "fit exclusions must not delete usable camera estimates")
+    try check(simd_length(MetricCameraAlignment.position(MetricCameraAlignment.matrix(retained.cameras[11].transform)!)-MetricCameraAlignment.position(outliers[11].reference)) > 2.9,
+              "global alignment must preserve local trajectory differences")
     raw.removeLast()
     try check(try CapturePhotogrammetry.align(raw:raw,points:points,inputs:inputs).cameras.count == 11, "no fabricated missing poses")
     raw.append(raw[0])
@@ -79,7 +88,7 @@ private func selfTest() async throws {
     print("PASS per-frame correspondence, image-scaled K, camera conventions and missing frames")
 
     // Symmetric room points do not reveal the camera's forward axis. The known
-    // rotating reference trajectory must resolve it without relaxing tolerances.
+    // rotating reference trajectory must resolve the convention without a position gate.
     var roomInputs: [CapturePhotogrammetrySamples.Input] = []
     var roomRaw: [VideoPhotogrammetry.RawPose] = []
     for i in 0..<12 {
