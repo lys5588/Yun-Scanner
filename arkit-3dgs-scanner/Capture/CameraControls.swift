@@ -81,10 +81,16 @@ final class CameraControls: ObservableObject {
     // arrive after dismissal; they must not reapply settings after restoration.
     private var controlledDevice: AVCaptureDevice?
 
-    func beginSession(limitExposure: Bool) {
+    func beginSession(maxExposureSeconds: Double?) {
         controlledDevice = device
         restoreAutomaticSettings()
-        if limitExposure { capExposureDuration() }
+        setExposureLimit(seconds: maxExposureSeconds)
+    }
+
+    var observedMaxExposureSeconds: Double? {
+        guard let d = controlledDevice else { return nil }
+        let seconds = CMTimeGetSeconds(d.activeMaxExposureDuration)
+        return seconds.isFinite && seconds > 0 ? seconds : nil
     }
 
     // MARK: - 裝置能力（UI 的滑桿範圍要照實際硬體，不能寫死）
@@ -202,12 +208,16 @@ final class CameraControls: ObservableObject {
     /// 隨曝光線性上升：0.3 rad/s（很慢的平移）在 1/15s 下就是 30 px 模糊，等於整段掃描沒有一張能用。
     /// 拉 ISO 換來的雜訊對 3DGS 遠比模糊便宜 —— 雜訊在多視角平均下會消掉，模糊不會。
     /// 掃描開始前就要設好，讓 AE 有時間在上限內收斂。
-    func capExposureDuration() {
+    func setExposureLimit(seconds: Double?) {
         withDevice { d in
+            guard let seconds else { d.activeMaxExposureDuration = .invalid; return }
+            guard seconds.isFinite, seconds > 0 else { return }
             let lo = CMTimeGetSeconds(d.activeFormat.minExposureDuration)
             let hi = CMTimeGetSeconds(d.activeFormat.maxExposureDuration)
+            guard lo.isFinite, hi.isFinite, lo > 0, hi >= lo else { return }
             d.activeMaxExposureDuration =
-                CMTimeMakeWithSeconds(min(max(Self.kMaxShutter, lo), hi), preferredTimescale: 1_000_000)
+                CMTimeMakeWithSeconds(min(max(seconds, lo), hi), preferredTimescale: 1_000_000)
+            print("[CameraControls] requested exposure limit=\(seconds), observed=\(CMTimeGetSeconds(d.activeMaxExposureDuration))")
         }
     }
 

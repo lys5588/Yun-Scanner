@@ -54,6 +54,12 @@ nonisolated struct FrameRecord: Codable, Sendable {
     var confidenceFile: String?
     var depthWidth: Int?
     var depthHeight: Int?
+    /// Present for JPEGs decoded from an actual accepted video sample, without rotation.
+    var sourceFrameID: Int? = nil
+    var sourceVideoFile: String? = nil
+    var sourceVideoPTS: Double? = nil
+    var imageSource: String? = nil
+    var exposureMetadataAvailable: Bool? = nil
 }
 
 /// Scan metadata has a capture-specific name so trainer format detection ignores it.
@@ -113,6 +119,16 @@ nonisolated struct SessionMeta: Codable, Sendable {
     /// The continuous RGB/depth stream is separate from legacy selected keyframes.
     /// Nil preserves compatibility with scans created before this research package.
     var streamCapture: StreamCaptureMeta? = nil
+    var acquisitionPolicy: CaptureAcquisitionPolicy? = nil
+}
+
+nonisolated struct CaptureAcquisitionPolicy: Codable, Sendable {
+    var photoSampling: String
+    var photoMinimumIntervalSeconds: Double
+    var photoQualityPolicy: String
+    var requestedMaxExposureSeconds: Double?
+    var observedMaxExposureSeconds: Double?
+    var imageStabilization = "original_arkit_pipeline_no_added_warp"
 }
 
 nonisolated struct StreamCaptureMeta: Codable, Sendable {

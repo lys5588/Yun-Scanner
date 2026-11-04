@@ -123,7 +123,7 @@ struct BetaSceneView: View {
                             Label(L10n.text("仅通过筛选的图像与相机参数"), systemImage: "checkmark.circle")
                             Text(entry?.isVideoImport == true
                                  ? L10n.text("仅包含有效图像与对应相机参数；原视频与未筛选点云保留在原始归档中。")
-                                 : L10n.text("图像、两套相机参数和深度使用同一有效帧名单；完整视频与未筛选点云保留在原始归档中。"))
+                                 : L10n.text("保留全部有效图像和 ARKit 参数；RealityKit 单独保存成功结果，并列出缺失帧。"))
                                 .font(.caption).foregroundStyle(.secondary)
                         }
                         if includeLiDAR { Label(L10n.text("LiDAR 深度与置信度"), systemImage: "square.3.layers.3d") }
@@ -217,8 +217,11 @@ struct BetaSceneView: View {
         guard let report = cameraReport else { return L10n.text("尚未估计，当前保存的是原始 ARKit 参数。") }
         switch report.status {
         case "estimated_aligned":
-            return L10n.text("已估计并对齐 \(report.estimatedFrameCount) / \(report.inputFrameCount) 张关键帧；原始参数已保留。")
+            return L10n.text("已估计并对齐 \(report.estimatedFrameCount) / \(report.inputFrameCount) 张图像；原始参数已保留。")
+                + "\n" + L10n.text("逐图请求相机估计；未返回位姿的图像仍保留 ARKit 参数，实际提交和缺失情况见报告。")
                 + "\n" + L10n.text("重建包分文件夹保存两套参数，默认使用 RealityKit；当前预览和训练仍使用 ARKit。")
+                + (report.batches?.count ?? 0 > 1 ? "\n" + L10n.text("图像分组估计后分别对齐到 ARKit 世界；各组不是一次联合优化。") : "")
+                + (report.reason != nil ? "\n" + L10n.text("部分分组未完成估计或配准，请查看原始报告中的缺失记录。") : "")
                 + "\n" + L10n.text("这些结果尚未通过独立精度验证。")
         case "alignment_rejected": return L10n.text("RealityKit 已返回结果，但坐标配准未完成。请重新估计相机参数；原始结果仍保留。")
         case "unsupported": return L10n.text("设备不支持摄影测量，保留原始 ARKit 参数。")

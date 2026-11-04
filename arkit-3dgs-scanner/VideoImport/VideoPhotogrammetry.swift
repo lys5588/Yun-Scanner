@@ -83,6 +83,7 @@ nonisolated enum VideoPhotogrammetry {
     }
 
     struct RawPose: Codable {
+        var estimationBatchID: Int? = nil
         let sampleID: Int
         let imageFile: String
         let timestamp: Double

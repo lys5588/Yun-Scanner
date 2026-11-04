@@ -936,7 +936,7 @@
 
 "尚未估计，当前保存的是原始 ARKit 参数。" = "Not estimated yet. Original ARKit parameters are saved.";
 
-"已估计并对齐 %@ / %@ 张关键帧；原始参数已保留。" = "Estimated and aligned %@ / %@ keyframes. Original parameters are preserved.";
+"已估计并对齐 %@ / %@ 张图像；原始参数已保留。" = "Estimated and aligned %@ / %@ keyframes. Original parameters are preserved.";
 
 "这些结果尚未通过独立精度验证。" = "These results have not undergone independent accuracy validation.";
 
@@ -970,3 +970,23 @@
 "差值用于比较两套估计，不代表真实误差或拍摄抖动。" = "This compares the two estimates; it does not measure absolute error or camera shake.";
 
 "重建包分文件夹保存两套参数，默认使用 RealityKit；当前预览和训练仍使用 ARKit。" = "The reconstruction package saves both camera sets in separate folders and defaults to RealityKit. Preview and training still use ARKit.";
+
+"减少运动模糊：开 · 曝光上限 1/120 秒" = "Reduce motion blur: On · Maximum exposure 1/120 s";
+
+"减少运动模糊：关 · 系统自动曝光" = "Reduce motion blur: Off · System auto exposure";
+
+"短曝光可能增加噪声；不会对画面裁切或变形。" = "Short exposures may add noise; images are not cropped or warped.";
+
+"停止后逐帧保存图像并估计相机参数" = "Save every recorded frame and estimate cameras after stopping";
+
+"原生视频 · 每个已录制帧均保存图像" = "Native video · Save every recorded frame as an image";
+
+"保留全部有效图像和 ARKit 参数；RealityKit 单独保存成功结果，并列出缺失帧。" = "Keep all valid images and ARKit cameras. Save successful RealityKit estimates separately and list missing frames.";
+
+"逐图请求相机估计；未返回位姿的图像仍保留 ARKit 参数，实际提交和缺失情况见报告。" = "Request an estimate for every image. Images without a RealityKit pose retain ARKit parameters; the report records actual submissions and missing results.";
+
+"正在逐帧保存图像…" = "Saving images from every recorded frame…";
+
+"图像分组估计后分别对齐到 ARKit 世界；各组不是一次联合优化。" = "Image batches are estimated independently and aligned to the ARKit world; they are not a joint optimization.";
+
+"部分分组未完成估计或配准，请查看原始报告中的缺失记录。" = "Some batches could not be estimated or aligned. See the original report for missing results.";

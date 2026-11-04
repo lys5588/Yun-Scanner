@@ -100,27 +100,33 @@ enum BetaFilteredExportTests {
         let zip = try await BetaSceneArchive.shared.save(directory:scene,includeLiDAR:true)
         try BetaSceneTests.unpack(zip,to:root.appendingPathComponent("unpacked"))
         let output = root.appendingPathComponent("unpacked/scan_policy")
-        for path in ["arkit/poses.jsonl","realitykit/poses.jsonl","frames.jsonl"] {
-            try check(try readRows(output.appendingPathComponent(path)).map { $0["id"] as! Int } == [1,2,5],"common accepted frame IDs: "+path)
+        for path in ["arkit/poses.jsonl","arkit/frames.jsonl","frames.jsonl"] {
+            try check(try readRows(output.appendingPathComponent(path)).map { $0["id"] as! Int } == [1,2,4,5,10,11],"complete valid ARKit images: "+path)
+        }
+        for path in ["realitykit/poses.jsonl","realitykit/frames.jsonl"] {
+            try check(try readRows(output.appendingPathComponent(path)).map { $0["id"] as! Int } == [1,2,5,10],"actual RealityKit results: "+path)
         }
         let outputNative = try JSONSerialization.jsonObject(with:Data(contentsOf:output.appendingPathComponent("realitykit/native-cameras.json"))) as! [[String: Any]]
-        try check(outputNative.map { $0["sampleID"] as! Int } == [1,2,5],"native cameras must use the same filtered IDs")
-        let ark = try readRows(output.appendingPathComponent("arkit/poses.jsonl")).last!["transform"] as! [Double]
-        let rk = try readRows(output.appendingPathComponent("realitykit/poses.jsonl")).last!["transform"] as! [Double]
+        try check(outputNative.map { $0["sampleID"] as! Int } == [1,2,5,10],"native cameras must match estimated IDs")
+        let ark = try readRows(output.appendingPathComponent("arkit/poses.jsonl")).first { $0["id"] as? Int == 5 }!["transform"] as! [Double]
+        let rk = try readRows(output.appendingPathComponent("realitykit/poses.jsonl")).first { $0["id"] as? Int == 5 }!["transform"] as! [Double]
         try check(abs(rk[3]-ark[3]-3) < 1e-8,"registration outlier retained without snapping to ARKit")
         let manifest = try read(output.appendingPathComponent("scene-package.json"))
-        try check(manifest["schemaVersion"] as? Int == 5 && manifest["poseFile"] as? String == "realitykit/poses.jsonl","dual-folder manifest")
+        try check(manifest["schemaVersion"] as? Int == 6 && manifest["poseFile"] as? String == "realitykit/poses.jsonl" && manifest["frameCount"] as? Int == 6 && manifest["poseFrameCount"] as? Int == 4,"independent camera count manifest")
         try check(try read(output.appendingPathComponent("alignment.json"))["transformAlreadyApplied"] as? Bool == true,"prevent double transform")
         let selection = try read(output.appendingPathComponent("selection.json"))
         let excluded = selection["excludedFrames"] as! [[String: Any]]
         let reasons = Dictionary(uniqueKeysWithValues:excluded.map { ($0["id"] as! Int,$0["reason"] as! String) })
-        try check(reasons == [3:"video_frame_dropped",4:"photogrammetry_missing",6:"tracking_not_normal",
-            7:"image_missing_or_invalid",8:"depth_missing_or_invalid",9:"depth_missing_or_invalid",10:"quality_rejected",
-            11:"camera_correspondence_invalid",12:"invalid_arkit_or_source_camera"],"rejection reasons")
+        try check(reasons == [3:"video_frame_dropped",6:"tracking_not_normal",
+            7:"image_missing_or_invalid",8:"depth_missing_or_invalid",9:"depth_missing_or_invalid",
+            12:"invalid_arkit_or_source_camera"],"only invalid data is excluded")
+        let unavailable = selection["realitykitUnavailableFrames"] as! [[String: Any]]
+        try check(unavailable.map { $0["id"] as! Int } == [4,11],"missing estimates are audited without deleting valid photos")
+        try check(selection["pairedFrameIDs"] as? [Int] == [1,2,5,10],"comparison subset is explicit")
         try check(selection["droppedContinuousFrameIDs"] as? [Int] == [30],"drop audit")
         try check(Set(try fm.contentsOfDirectory(atPath:output.path)) == Set(["images","depth","arkit","realitykit","alignment.json","frames.jsonl","selection.json","scene-package.json"]),"allowlist excludes unfiltered data")
-        try check(try fm.contentsOfDirectory(atPath:output.appendingPathComponent("images").path).count == 3,"rejected image leaked")
-        try check(try fm.contentsOfDirectory(atPath:output.appendingPathComponent("depth").path).count == 6,"rejected depth leaked")
+        try check(try fm.contentsOfDirectory(atPath:output.appendingPathComponent("images").path).count == 6,"valid image missing or invalid image leaked")
+        try check(try fm.contentsOfDirectory(atPath:output.appendingPathComponent("depth").path).count == 12,"depth availability must match image set")
         try check(try hashes(scene) == before,"export modified original data")
         let rgb = try await BetaSceneArchive.shared.save(directory:scene,includeLiDAR:false)
         try BetaSceneTests.unpack(rgb,to:root.appendingPathComponent("rgb"))
@@ -131,6 +137,42 @@ enum BetaFilteredExportTests {
             try check(!text.contains("depthFile") && !text.contains("confidenceFile"),"dangling depth reference")
         }
         try check(try read(rgbOutput.appendingPathComponent("selection.json"))["usedDepthInEstimation"] as? Bool == true,"depth estimation provenance")
+
+        // No valid RealityKit correspondence must never replace ARKit with invented poses.
+        let invalidCameras = cameras.map { row -> [String: Any] in var r = row; r["timestamp"] = -1.0; return r }
+        try rows(invalidCameras,scene.appendingPathComponent("camera-estimation/test/cameras.jsonl"))
+        let arkOnly = try await BetaSceneArchive.shared.save(directory:scene,includeLiDAR:true)
+        try BetaSceneTests.unpack(arkOnly,to:root.appendingPathComponent("ark-only"))
+        let arkOutput = root.appendingPathComponent("ark-only/scan_policy")
+        let arkManifest = try read(arkOutput.appendingPathComponent("scene-package.json"))
+        try check(arkManifest["poseFile"] as? String == "arkit/poses.jsonl" && arkManifest["realitykitFrameCount"] as? Int == 0,"explicit ARKit default when no estimated cameras survive")
+        try check(try readRows(arkOutput.appendingPathComponent("arkit/poses.jsonl")).count == 6 && readRows(arkOutput.appendingPathComponent("realitykit/poses.jsonl")).isEmpty,"no overwrite or fabricated RealityKit camera")
+        try rows(cameras,scene.appendingPathComponent("camera-estimation/test/cameras.jsonl"))
+
+        // Independent native worlds must carry the transform for the exact producing batch.
+        var batched = report
+        batched.removeValue(forKey: "alignment")
+        batched["schemaVersion"] = 4
+        batched["batches"] = (0...1).map { batch in
+            ["id": batch, "status": "estimated_aligned", "alignment": ["inlierIDs": cameras.compactMap { $0["id"] as? Int }.filter { $0 % 2 == batch }, "rejectedIDs": []]] as [String: Any]
+        }
+        let batchCameras = cameras.map { row -> [String: Any] in var r = row; r["estimationBatchID"] = (r["id"] as! Int) % 2; return r }
+        let batchNative = native.map { row -> [String: Any] in var r = row; r["estimationBatchID"] = (r["sampleID"] as! Int) % 2; return r }
+        try rows(batchCameras, scene.appendingPathComponent("camera-estimation/test/cameras.jsonl"))
+        try json(batchNative, scene.appendingPathComponent("camera-estimation/test/raw-cameras.json"))
+        try json(batched, reportURL)
+        let batchZIP = try await BetaSceneArchive.shared.save(directory:scene,includeLiDAR:true)
+        try BetaSceneTests.unpack(batchZIP,to:root.appendingPathComponent("batches"))
+        let batchOutput = root.appendingPathComponent("batches/scan_policy")
+        try check((try read(batchOutput.appendingPathComponent("alignment.json"))["batches"] as? [[String: Any]])?.count == 2, "all independent batch transforms are exported")
+        try check(try readRows(batchOutput.appendingPathComponent("realitykit/poses.jsonl")).map { $0["id"] as! Int } == [1,2,5,10], "batch camera correspondence")
+        var mismatched = batchCameras; mismatched[0]["estimationBatchID"] = 100
+        try rows(mismatched, scene.appendingPathComponent("camera-estimation/test/cameras.jsonl"))
+        do { _ = try await BetaSceneArchive.shared.save(directory:scene,includeLiDAR:true); throw NSError(domain:"unknown batch accepted",code:1) }
+        catch is BetaReconstructionExport.ExportError { }
+        try rows(cameras, scene.appendingPathComponent("camera-estimation/test/cameras.jsonl"))
+        try json(native, scene.appendingPathComponent("camera-estimation/test/raw-cameras.json"))
+        try json(report, reportURL)
 
         let exports = root.appendingPathComponent("exports")
         let exportCount = try fm.contentsOfDirectory(atPath:exports.path).count
@@ -168,11 +210,11 @@ enum BetaFilteredExportTests {
         try check(!fm.fileExists(atPath:videoOutput.appendingPathComponent("arkit").path),"invented ARKit parameters")
 
         // Valid reports with no surviving frames cannot fall back to original capture.
-        for i in originals.indices { originals[i]["blurVerdict"] = "reject" }
+        for i in originals.indices { originals[i]["transform"] = [Double](repeating:0,count:16) }
         try rows(originals,scene.appendingPathComponent("poses.jsonl"))
         report["sourcePosesSHA256"] = try hash(scene.appendingPathComponent("poses.jsonl")); try json(report,reportURL)
         do { _ = try await BetaSceneArchive.shared.save(directory:scene,includeLiDAR:true); throw NSError(domain:"zero frames exported",code:1) }
         catch is BetaReconstructionExport.ExportError { }
-        print("PASS: filtered export intersection, dropped/tracking/quality/pose/image/depth exclusions, aligned membership, common IDs, allowlist, original hashes, RGB policy, failure atomicity, non-metric video")
+        print("PASS: independent ARKit/RealityKit frame lists, missing estimates and quality annotations preserve photos, invalid/drop/depth exclusions, membership, original hashes, RGB policy, atomicity, non-metric video")
     }
 }

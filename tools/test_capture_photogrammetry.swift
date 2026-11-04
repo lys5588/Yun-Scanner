@@ -21,6 +21,14 @@ private func frame(_ id: Int, _ pose: simd_double4x4) -> FrameRecord {
 }
 @available(macOS 26.0, *)
 private func selfTest() async throws {
+    for limit in [8, 9, 16, 200, 1000] {
+        for count in [8, 9, 16, 201, 1001, 2507] {
+            let ranges = try CapturePhotogrammetry.batchRanges(count: count, limit: limit)
+            try check(ranges.allSatisfy { $0.count >= 8 && $0.count <= limit }, "each session obeys official limits")
+            try check(Set(ranges.flatMap { Array($0) }) == Set(0..<count), "every input is covered across batch boundaries")
+        }
+    }
+    print("PASS bounded overlapping sessions cover every input, including short tails")
     let root = FileManager.default.temporaryDirectory.appendingPathComponent("camera-estimation-\(UUID().uuidString)")
     try FileManager.default.createDirectory(at: root, withIntermediateDirectories: false)
     defer { try? FileManager.default.removeItem(at: root) }
@@ -52,6 +60,16 @@ private func selfTest() async throws {
     let disagreement = try MetricCameraAlignment.solve(inconsistent)
     try check(disagreement.medianPositionErrorMeters > 0.03 && disagreement.warnings?.contains("trajectory_disagreement_not_accuracy_failure") == true,
               "large disagreement is diagnostic, not proof RealityKit is wrong")
+    let trimmingFloor = (0..<20).map { i -> MetricCameraAlignment.Pair in
+        var estimated = matrix_identity_double4x4
+        estimated[3].x = Double(i) * 0.03
+        var reference = estimated
+        if i < 6 { reference[3].y = i % 2 == 0 ? 0.5 : -0.5 }
+        return .init(id: i, estimated: estimated, reference: reference)
+    }
+    let stoppedFit = try MetricCameraAlignment.solve(trimmingFloor)
+    try check(stoppedFit.inlierIDs.count == 20 && abs(stoppedFit.scale - 1) < 1e-8 && stoppedFit.p90PositionErrorMeters > 0.4,
+              "80 percent floor stops trimming without discarding a valid transform or hiding disagreement")
     var reflection = matrix_identity_double4x4; reflection[0][0] = -1
     try check(!MetricCameraAlignment.valid(reflection), "reflection is not a camera rotation")
     print("PASS metric registration, rigid cameras, outlier and degeneracy rejection")
@@ -133,6 +151,7 @@ private func selfTest() async throws {
     try check(value(10,10) == 1 && value(90,10).isNaN && value(10,90) == 3 && value(90,90) == 4, "metric depth/confidence alignment")
     CVPixelBufferUnlockBaseAddress(d,.readOnly)
     try check(sequence.suppliedDepthIDs == [0], "depth provenance")
+    try check(sequence.submittedSampleIDs == [0], "every successfully constructed sample is audited")
     try Data([2,3,1,2]).write(to:confidenceURL)
     try rejects("bad confidence") { _ = try sequence.depthBuffer(input) }
     try Data([0,0,0,0]).write(to:confidenceURL)
@@ -162,12 +181,19 @@ private func selfTest() async throws {
         guard #available(macOS 26.0, *) else { throw NSError(domain:"Requires macOS 26 or later",code:1) }
         let args = Array(CommandLine.arguments.dropFirst())
         if args.isEmpty { try await selfTest(); return }
-        try check(args.count == 3 && ["--replay","--cancel"].contains(args[0]), "usage: --replay|--cancel SOURCE NEW_OUTPUT")
+        if args.count == 2 && args[0] == "--estimate-existing" {
+            let root = URL(fileURLWithPath: args[1])
+            let report = try await CapturePhotogrammetry.run(directory: root, maximumImagesPerBatch: 150) { print("progress \($0)") }
+            print("RESULT status=\(report.status), inputs=\(report.inputFrameCount), submitted=\(report.submittedFrameIDs?.count ?? 0), cameras=\(report.estimatedFrameCount), batches=\(report.batches?.count ?? 0)")
+            try check(report.status == "estimated_aligned" && report.submittedFrameIDs?.count == report.inputFrameCount, "actual full-frame estimation must submit every input")
+            return
+        }
+        try check(args.count == 3 && ["--replay","--cancel","--replay-batches","--replay-small-batches"].contains(args[0]), "usage: --replay|--cancel SOURCE NEW_OUTPUT")
         let source = URL(fileURLWithPath:args[1]), output = URL(fileURLWithPath:args[2])
         try check(!FileManager.default.fileExists(atPath:output.path), "replay output must be new")
         try FileManager.default.copyItem(at:source,to:output)
         let before = try Data(contentsOf:output.appendingPathComponent("poses.jsonl"))
-        let task = Task { try await CapturePhotogrammetry.run(directory:output) { print("progress \($0)") } }
+        let task = Task { try await CapturePhotogrammetry.run(directory:output, maximumImagesPerBatch: args[0] == "--replay-batches" ? 150 : (args[0] == "--replay-small-batches" ? 16 : nil)) { print("progress \($0)") } }
         if args[0] == "--cancel" { try await Task.sleep(for:.milliseconds(500)); task.cancel() }
         do {
             let report = try await task.value

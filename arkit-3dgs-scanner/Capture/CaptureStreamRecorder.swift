@@ -24,6 +24,11 @@ nonisolated struct CaptureStreamFrame: Codable, Sendable {
     var confidenceFile: String?
     var depthWidth: Int?
     var depthHeight: Int?
+    var exposureDuration: Double? = nil
+    var exposureOffsetEV: Double? = nil
+    /// Device readback; unlike exposureDuration, ISO is not an ARFrame property.
+    var iso: Double? = nil
+    var estimatedBlurPx: Double? = nil
 }
 
 nonisolated struct CaptureStreamPacket: @unchecked Sendable {
@@ -193,7 +198,7 @@ actor CaptureStreamRecorder {
             segmentStartTimestamp = sourceTimestamp
         }
         activeSegmentSamples += 1
-        return .written(seconds)
+        return .written(CMTimeGetSeconds(time))
     }
 
     private func startSegment(for pixelBuffer: CVPixelBuffer) throws {

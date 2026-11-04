@@ -12,7 +12,7 @@ import UIKit
 nonisolated enum CapturePhotogrammetry {
     static let reportName = "camera-estimation.json"
     struct Report: Codable, Sendable {
-        var schemaVersion = 2
+        var schemaVersion = 4
         var alignmentPolicy: String? = "global_similarity_fit_outliers_retained"
         var method = "RealityKit.PhotogrammetrySession"
         var status = "processing"
@@ -20,6 +20,12 @@ nonisolated enum CapturePhotogrammetry {
         var inputFrameCount = 0
         var estimatedFrameCount = 0
         var rawEstimatedFrameCount = 0
+        var inputFrameIDs: [Int]?
+        var submittedFrameIDs: [Int]?
+        var sampleIssues: [String: String]?
+        var maximumInputImages: Int?
+        var batches: [BatchReport]?
+        var batchPolicy: String?
         var depthFrameIDs: [Int] = []
         var missingCameraFrameIDs: [Int] = []
         var sourcePosesSHA256 = ""
@@ -31,7 +37,7 @@ nonisolated enum CapturePhotogrammetry {
         var alignment: MetricCameraAlignment.Result?
         var seconds = 0.0
         var originalCameraFile = "poses.jsonl"
-        var scope = "saved_keyframes_only; continuous frames.jsonl is unchanged"
+        var scope = "all_saved_images_without_viewpoint_or_quality_selection"
         var worldCoordinates = "original ARKit world, meters, gravity-aligned Y-up"
         var cameraConvention = "OpenGL camera-to-world, row-major"
         var scaleReference = "original ARKit camera trajectory"
@@ -39,7 +45,37 @@ nonisolated enum CapturePhotogrammetry {
         var depthPolicy = "same-frame metric depth; confidence below medium masked as NaN; resized to sample pixels"
         var projectionChecks: [VideoPhotogrammetry.CandidateScore]?
     }
+    struct BatchReport: Codable, Sendable {
+        var id: Int
+        var inputFrameIDs: [Int]
+        var submittedFrameIDs: [Int] = []
+        var status = "processing"
+        var reason: String?
+        var cameraFrameIDs: [Int] = []
+        var sampleIssues: [String: String]?
+        var rawCameraFile: String?
+        var rawPointCloudFile: String?
+        var alignment: MetricCameraAlignment.Result?
+        var coordinateAdaptation: String?
+    }
+    /// Overlap provides context at boundaries; every index belongs to at least one session.
+    /// A trailing short window is shifted backwards instead of producing <8 samples.
+    static func batchRanges(count: Int, limit: Int) throws -> [Range<Int>] {
+        guard limit >= 8, count >= 8 else { throw Failure.invalidInput("photogrammetry needs at least eight images per session") }
+        if count <= limit { return [0..<count] }
+        let overlap = min(32, max(1, limit / 5))
+        var result: [Range<Int>] = [], start = 0
+        while start < count {
+            let end = min(count, start + limit)
+            let lower = end == count ? max(0, min(start, count - 8)) : start
+            result.append(lower..<end)
+            if end == count { break }
+            start = end - overlap
+        }
+        return result
+    }
     struct Camera: Codable, Sendable {
+        var estimationBatchID: Int? = nil
         let id: Int
         let imageFile: String
         let timestamp: Double
@@ -120,19 +156,19 @@ nonisolated enum CapturePhotogrammetry {
         func release() { busy = false }
     }
     private static let gate = Gate()
-    static func run(directory: URL, progress: @Sendable @escaping (Double) -> Void = { _ in }) async throws -> Report {
+    static func run(directory: URL, maximumImagesPerBatch: Int? = nil, progress: @Sendable @escaping (Double) -> Void = { _ in }) async throws -> Report {
         guard await gate.acquire() else { throw Failure.processing("another camera estimation is running") }
         do {
             // Explicitly leave the UI actor even with approachable concurrency enabled.
             // Keep the gate until cancellation has drained the underlying RealityKit session.
             let worker = Task.detached(priority: .userInitiated) {
-                try await runExclusively(directory: directory, progress: progress)
+                try await runExclusively(directory: directory, maximumImagesPerBatch: maximumImagesPerBatch, progress: progress)
             }
             let result = try await withTaskCancellationHandler { try await worker.value } onCancel: { worker.cancel() }
             await gate.release(); return result
         } catch { await gate.release(); throw error }
     }
-    private static func runExclusively(directory: URL, progress: @Sendable @escaping (Double) -> Void) async throws -> Report {
+    private static func runExclusively(directory: URL, maximumImagesPerBatch: Int?, progress: @Sendable @escaping (Double) -> Void) async throws -> Report {
         let start = Date()
         var report = Report()
         let reportURL = directory.appendingPathComponent(reportName)
@@ -151,52 +187,114 @@ nonisolated enum CapturePhotogrammetry {
             let source = try Data(contentsOf: file("poses.jsonl", under: directory))
             report.sourcePosesSHA256 = hash(source)
             let records = try records(source)
+            if (meta["acquisitionPolicy"] as? [String: Any])?["photoSampling"] as? String == "all_recorded_video_frames" {
+                let frameData = try Data(contentsOf: file("frame-images.json", under: directory))
+                let imageReport = try JSONSerialization.jsonObject(with: frameData) as? [String: Any]
+                guard imageReport?["status"] as? String == "complete",
+                      imageReport?["imageCount"] as? Int == records.count else {
+                    throw Failure.invalidInput("full-frame JPEG extraction is incomplete")
+                }
+            }
             report.inputFrameCount = records.count
+            report.inputFrameIDs = records.map(\.id)
             try write(report, to: reportURL)
             guard records.count >= 8 else { report.status = "insufficient_frames"; try write(report,to:reportURL); return report }
             guard #available(iOS 26.0, macOS 26.0, *), PhotogrammetrySession.isSupported else {
                 report.status = "unsupported"; try write(report,to:reportURL); return report
             }
-            guard records.count <= min(200, PhotogrammetrySession.limits.maximumNumberOfInputImages) else {
-                report.status = "too_many_frames"; report.reason = "No frames silently subsampled; maximum \(min(200, PhotogrammetrySession.limits.maximumNumberOfInputImages))"
-                try write(report,to:reportURL); return report
-            }
+            let inputLimit = PhotogrammetrySession.limits.maximumNumberOfInputImages
+            report.maximumInputImages = inputLimit
+            let ranges = try batchRanges(count: records.count, limit: min(inputLimit, maximumImagesPerBatch ?? 200))
+            report.batches = []
+            report.batchPolicy = "overlapping_contiguous_windows; independent solves aligned to ARKit; first successful aligned estimate wins per id; no joint bundle adjustment across batches"
             let inputs = try inputs(records: records, directory: directory)
-            let samples = CapturePhotogrammetrySamples(inputs: inputs)
-            let output = try await estimate(samples: samples, progress: progress)
-            try Task.checkCancellation()
-            report.depthFrameIDs = samples.suppliedDepthIDs
             try fm.createDirectory(at: staging, withIntermediateDirectories: false)
-            let raw = output.raw
-            report.rawEstimatedFrameCount = raw.count
-            try write(raw, to: staging.appendingPathComponent("cameras-realitykit.json"))
-            try VideoPhotogrammetry.writePLY(output.points, to: staging.appendingPathComponent("points-realitykit.ply"))
             let destinationName = "camera-estimation/\(token)"
+            var rawByID: [Int: VideoPhotogrammetry.RawPose] = [:]
+            var camerasByID: [Int: Camera] = [:]
+            var worldPoints: [SparsePoint] = []
+            var submitted = Set<Int>(), depthIDs = Set<Int>()
+            var issues: [String: String] = [:]
+            for (batchID, range) in ranges.enumerated() {
+                try Task.checkCancellation()
+                let batchInputs = Array(inputs[range])
+                let samples = CapturePhotogrammetrySamples(inputs: batchInputs)
+                var batch = BatchReport(id: batchID, inputFrameIDs: batchInputs.map { $0.record.id })
+                let prefix = ranges.count == 1 ? "" : "batch-\(batchID)-"
+                do {
+                    let output = try await estimate(samples: samples) { value in
+                        progress((Double(batchID) + value) / Double(ranges.count))
+                    }
+                    try Task.checkCancellation()
+                    var raw = output.raw
+                    for i in raw.indices { raw[i].estimationBatchID = batchID }
+                    try write(raw, to: staging.appendingPathComponent(prefix + "cameras-realitykit.json"))
+                    try VideoPhotogrammetry.writePLY(output.points, to: staging.appendingPathComponent(prefix + "points-realitykit.ply"))
+                    batch.rawCameraFile = destinationName + "/" + prefix + "cameras-realitykit.json"
+                    batch.rawPointCloudFile = destinationName + "/" + prefix + "points-realitykit.ply"
+                    for camera in raw where rawByID[camera.sampleID] == nil { rawByID[camera.sampleID] = camera }
+                    batch.sampleIssues = output.issues
+                    for (id, reason) in output.issues { issues[id] = reason }
+                    do {
+                        let built = try align(raw: raw, points: output.points, inputs: batchInputs)
+                        batch.alignment = built.alignment
+                        batch.coordinateAdaptation = built.coordinateAdaptation
+                        batch.cameraFrameIDs = built.cameras.map(\.id)
+                        let native = Dictionary(uniqueKeysWithValues: raw.map { ($0.sampleID, $0) })
+                        for var camera in built.cameras where camerasByID[camera.id] == nil {
+                            camera.estimationBatchID = batchID
+                            camerasByID[camera.id] = camera
+                            rawByID[camera.id] = native[camera.id]
+                        }
+                        // Each batch's points use that batch's own similarity transform.
+                        worldPoints += output.points.map { p in
+                            let q = built.alignment.point(SIMD3(Double(p.position.x), Double(p.position.y), Double(p.position.z)))
+                            return SparsePoint(position: [q.x,q.y,q.z], rgb: [p.rgb.x,p.rgb.y,p.rgb.z])
+                        }
+                        if ranges.count == 1 {
+                            report.alignment = built.alignment
+                            report.projectionChecks = built.checks
+                            report.coordinateAdaptation = built.coordinateAdaptation
+                        }
+                        batch.status = "estimated_aligned"
+                    } catch {
+                        batch.status = "alignment_rejected"; batch.reason = String(describing: error)
+                    }
+                } catch {
+                    if error is CancellationError { throw error }
+                    batch.status = "failed"; batch.reason = String(describing: error)
+                }
+                batch.submittedFrameIDs = samples.submittedSampleIDs
+                submitted.formUnion(batch.submittedFrameIDs); depthIDs.formUnion(samples.suppliedDepthIDs)
+                report.batches?.append(batch)
+                report.submittedFrameIDs = submitted.sorted(); report.depthFrameIDs = depthIDs.sorted()
+                try write(report, to: reportURL)
+            }
+            let cameras = camerasByID.values.sorted { $0.timestamp < $1.timestamp }
+            let raw = rawByID.values.sorted { $0.timestamp < $1.timestamp }
+            report.rawEstimatedFrameCount = raw.count
+            report.estimatedFrameCount = cameras.count
+            report.sampleIssues = issues.filter { key, _ in Int(key).map { camerasByID[$0] == nil } ?? true }
+            report.missingCameraFrameIDs = records.filter { camerasByID[$0.id] == nil }.map(\.id)
+            // Aggregate native cameras retain batch IDs: different batches have different native worlds.
+            try write(raw, to: staging.appendingPathComponent("cameras-realitykit.json"))
             report.rawCameraFile = destinationName + "/cameras-realitykit.json"
-            report.rawPointCloudFile = destinationName + "/points-realitykit.ply"
-            do {
-                let built = try align(raw: raw, points: output.points, inputs: inputs)
-                report.alignment = built.alignment
-                report.projectionChecks = built.checks
-                report.coordinateAdaptation = built.coordinateAdaptation
-                report.estimatedFrameCount = built.cameras.count
-                let ids = Set(built.cameras.map(\.id))
-                report.missingCameraFrameIDs = records.filter { !ids.contains($0.id) }.map(\.id)
+            if ranges.count == 1 { report.rawPointCloudFile = report.batches?.first?.rawPointCloudFile }
+            if !cameras.isEmpty {
                 let encoder = JSONEncoder(); encoder.outputFormatting = [.sortedKeys]
                 var data = Data()
-                for camera in built.cameras { data.append(try encoder.encode(camera)); data.append(10) }
+                for camera in cameras { data.append(try encoder.encode(camera)); data.append(10) }
                 try data.write(to: staging.appendingPathComponent("cameras-arkit.jsonl"), options: .atomic)
-                let points = output.points.map { p -> SparsePoint in
-                    let q = built.alignment.point(SIMD3(Double(p.position.x), Double(p.position.y), Double(p.position.z)))
-                    return SparsePoint(position: [q.x,q.y,q.z],rgb: [p.rgb.x,p.rgb.y,p.rgb.z])
-                }
-                try write(points, to: staging.appendingPathComponent("points-arkit.json"))
+                try write(worldPoints, to: staging.appendingPathComponent("points-arkit.json"))
                 report.cameraFile = destinationName + "/cameras-arkit.jsonl"
                 report.pointCloudFile = destinationName + "/points-arkit.json"
                 report.status = "estimated_aligned"
-            } catch {
-                report.status = "alignment_rejected"; report.reason = String(describing: error)
-                report.missingCameraFrameIDs = records.map(\.id)
+                if report.batches?.contains(where: { $0.status != "estimated_aligned" }) == true {
+                    report.reason = "Some batches failed estimation or registration; see batches and missingCameraFrameIDs"
+                }
+            } else {
+                report.status = raw.isEmpty ? "failed" : "alignment_rejected"
+                report.reason = report.batches?.compactMap(\.reason).joined(separator: "; ")
             }
             try Task.checkCancellation()
             guard hash(try Data(contentsOf: file("poses.jsonl", under: directory))) == report.sourcePosesSHA256 else {
@@ -231,7 +329,7 @@ nonisolated enum CapturePhotogrammetry {
     }
     @available(iOS 26.0, macOS 26.0, *)
     private static func estimate(samples: CapturePhotogrammetrySamples, progress: @Sendable @escaping (Double) -> Void) async throws
-        -> (raw: [VideoPhotogrammetry.RawPose], points: [VideoPhotogrammetry.Point]) {
+        -> (raw: [VideoPhotogrammetry.RawPose], points: [VideoPhotogrammetry.Point], issues: [String: String]) {
         var config = PhotogrammetrySession.Configuration()
         config.sampleOrdering = .sequential; config.isObjectMaskingEnabled = false
         let session = try PhotogrammetrySession(input: samples, configuration: config)
@@ -252,6 +350,7 @@ nonisolated enum CapturePhotogrammetry {
             var cloud: PhotogrammetrySession.PointCloud?
             var completed = false
             var failure: String?
+            var issues: [String: String] = [:]
             var poseProgress = 0.0, cloudProgress = 0.0
             outputLoop: for try await output in session.outputs {
                 switch output {
@@ -265,6 +364,9 @@ nonisolated enum CapturePhotogrammetry {
                     if case .poses(let p) = result { poses = p }
                     if case .pointCloud(let p) = result { cloud = p }
                 case .requestError(_, let error): failure = error.localizedDescription; control.stop()
+                case .invalidSample(let id, let reason): issues[String(id)] = "invalidSample: " + reason
+                case .skippedSample(let id):
+                    if issues[String(id)] == nil { issues[String(id)] = "skippedSample" }
                 case .processingCancelled: try control.check(); throw Failure.processing(failure ?? "system cancelled estimation")
                 case .processingComplete: completed = true; break outputLoop
                 default: break
@@ -284,7 +386,7 @@ nonisolated enum CapturePhotogrammetry {
                     intrinsicsColumnMajor: pose.intrinsics.map(VideoPhotogrammetry.matrixColumnMajor),
                     lensDistortion: pose.lensDistortionData.map { VideoPhotogrammetry.RawLensDistortion(center: [$0.center.x,$0.center.y],radialLookupTable: $0.radialLookupTable) }))
             }
-            return (raw, cloud.points.map { VideoPhotogrammetry.Point(position: $0.position,rgb: SIMD3($0.color.x,$0.color.y,$0.color.z)) })
+            return (raw, cloud.points.map { VideoPhotogrammetry.Point(position: $0.position,rgb: SIMD3($0.color.x,$0.color.y,$0.color.z)) }, issues)
         }
         return try await withTaskCancellationHandler { try await worker.value } onCancel: { control.cancel() }
     }

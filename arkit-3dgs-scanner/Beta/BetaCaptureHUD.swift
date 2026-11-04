@@ -48,6 +48,14 @@ struct BetaCaptureHUD: View {
                     .accessibilityValue(controller.hasLiDAR ? "ON" : "OFF")
                     .accessibilityIdentifier("betaLiDAR")
             }.padding(16).background(.black.opacity(0.55), in: Capsule())
+            Button(action: controller.toggleMotionBlurReduction) {
+                Label(controller.reduceMotionBlur ? L10n.text("减少运动模糊：开 · 曝光上限 1/120 秒") : L10n.text("减少运动模糊：关 · 系统自动曝光"),
+                      systemImage: "timer")
+                    .font(.caption).frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(12).background(.black.opacity(0.6), in: RoundedRectangle(cornerRadius: 14))
+            }.disabled(recording).accessibilityIdentifier("betaMotionBlur")
+            Text(L10n.text("短曝光可能增加噪声；不会对画面裁切或变形。"))
+                .font(.caption2).foregroundStyle(.secondary)
             Label(locationRecorder.message, systemImage: "location.fill")
                 .font(.caption).lineLimit(2).frame(maxWidth: .infinity, alignment: .leading)
                 .padding(12).background(.black.opacity(0.6), in: RoundedRectangle(cornerRadius: 14))
@@ -95,7 +103,7 @@ struct BetaCaptureHUD: View {
                 .accessibilityLabel(recording ? L10n.text("停止拍摄") : L10n.text("开始拍摄"))
                 .accessibilityIdentifier("betaRecord")
                 .accessibilityHint(controller.sessionState.message)
-            Text(recording ? L10n.text("停止后整理位姿并进入预览") : L10n.text("原生视频 · 自动保存关键帧"))
+            Text(recording ? L10n.text("停止后逐帧保存图像并估计相机参数") : L10n.text("原生视频 · 每个已录制帧均保存图像"))
                 .font(.caption).foregroundStyle(.secondary)
         }.padding(20).padding(.bottom, 12)
             .background { if !available { DS.Palette.canvas.ignoresSafeArea() } }

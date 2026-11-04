@@ -99,7 +99,10 @@ nonisolated enum MetricCameraAlignment {
             let limit = max(0.03, 3 * quantile(residuals.map { $0.0 }))
             let angularLimit = max(5, 3 * quantile(residuals.map { $0.1 }))
             let kept = selected.filter { let e = errors($0, fit); return e.0 <= limit && e.1 <= angularLimit }
-            guard kept.count >= 8, kept.count * 5 >= pairs.count * 4 else { throw Failure.inconsistentTrajectories }
+            // The 80% floor bounds refinement, not camera acceptance. If another
+            // trimming iteration would cross it, retain the last valid fit. A broad
+            // disagreement with ARKit is diagnostic, not grounds to drop this batch.
+            guard kept.count >= 8, kept.count * 5 >= pairs.count * 4 else { break }
             if kept.count == selected.count { break }
             selected = kept
         }

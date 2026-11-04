@@ -22,10 +22,12 @@ nonisolated final class CapturePhotogrammetrySamples: Sequence, @unchecked Senda
     private let lock = NSLock()
     private var error: String?
     private var depthIDs = Set<Int>()
+    private var sampleIDs = Set<Int>()
     private var cancelled = false
     init(inputs: [Input]) { self.inputs = inputs }
     var failure: String? { lock.lock(); defer { lock.unlock() }; return error }
     var suppliedDepthIDs: [Int] { lock.lock(); defer { lock.unlock() }; return depthIDs.sorted() }
+    var submittedSampleIDs: [Int] { lock.lock(); defer { lock.unlock() }; return sampleIDs.sorted() }
     func cancel() { lock.lock(); cancelled = true; lock.unlock() }
     struct Iterator: IteratorProtocol {
         let owner: CapturePhotogrammetrySamples
@@ -76,6 +78,7 @@ nonisolated final class CapturePhotogrammetrySamples: Sequence, @unchecked Senda
             sample.depthDataMap = depth
             lock.lock(); depthIDs.insert(input.record.id); lock.unlock()
         }
+        lock.lock(); sampleIDs.insert(input.record.id); lock.unlock()
         return sample
     }
     /// Expand the aligned sensor depth to the actual sample image size without changing meters.

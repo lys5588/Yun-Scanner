@@ -152,6 +152,15 @@ final class CaptureController: NSObject, ObservableObject {
     @Published private(set) var imageReconstructionReport: RGBReconstructionEngine.Report?
     private(set) var config = CaptureConfig()
     var isBetaCapture = false
+    @Published private(set) var reduceMotionBlur = true
+    private var requestedMaxExposureSeconds: Double? {
+        isBetaCapture ? (reduceMotionBlur ? 1.0 / 120 : nil) : CameraControls.kMaxShutter
+    }
+    func toggleMotionBlurReduction() {
+        guard isBetaCapture, phase == .idle else { return }
+        reduceMotionBlur.toggle()
+        cameraControls.setExposureLimit(seconds: requestedMaxExposureSeconds)
+    }
     private var library: ScanLibrary { isBetaCapture ? .beta : .shared }
     var capturedDirectory: URL? { sessionDir }
     @Published private(set) var videoLongEdge = 1920
@@ -188,7 +197,8 @@ final class CaptureController: NSObject, ObservableObject {
         config.keyframeMaxAngularSpeedRadS = 3
         config.keyframeMaxLinearSpeedMS = 3
         config.minSharpnessRatio = 0.25
-        config.minKeyframeInterval = 0.5
+        // Beta JPEGs are decoded after recording; this interval no longer selects images.
+        config.denoiseMaxNoiseLevel = 0
     }
     func toggleVideoQuality() {
         guard phase == .idle, supports4K else { return }
@@ -786,7 +796,7 @@ final class CaptureController: NSObject, ObservableObject {
             if isBetaCapture {
                 arView?.session.pause()
                 monitor.stop()
-                guard let dir = sessionDir, !refinedRecords.isEmpty,
+                guard let dir = sessionDir, let writer,
                       streamTerminalFailure == nil, !streamMetadataWriteFailed else {
                     scanNotice = L10n.text("采集未完成，请保留原始数据并重试。")
                     return
@@ -794,11 +804,29 @@ final class CaptureController: NSObject, ObservableObject {
                 let points = await accumulator?.checkpointPoints(limit: 100_000, anchorTransforms: latestTileTransforms) ?? []
                 guard !cancel.isCancelled else { return }
                 do {
+                    statusText = L10n.text("正在逐帧保存图像…")
+                    keyframeCount = try await CaptureVideoFrames.append(directory: dir, writer: writer) { [self] fraction in
+                        Task { @MainActor [self] in
+                            guard self.isAttached, self.scanGeneration == generation else { return }
+                            self.exportProgress = fraction * 0.1
+                        }
+                    }
+                    refinedRecords = await writer.snapshotRecords()
+                    capturePerformance.savedPhotos = refinedRecords.count
+                    capturePerformance.configuredMinimumIntervalS = 0
+                    let savedIntervals = zip(refinedRecords, refinedRecords.dropFirst()).map { $1.timestamp - $0.timestamp }
+                    capturePerformance.savedIntervalTotalS = savedIntervals.reduce(0, +)
+                    capturePerformance.savedIntervalMaxS = savedIntervals.max() ?? 0
+                    let performanceEncoder = JSONEncoder(); performanceEncoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+                    try performanceEncoder.encode(capturePerformance).write(to: dir.appendingPathComponent("capture-performance.json"), options: .atomic)
+                    guard !cancel.isCancelled, !Task.isCancelled else { throw CancellationError() }
                     try await library.saveReview(directory: dir, points: points, records: refinedRecords)
                     let captureInfo: [String: Any] = ["schemaVersion": 1, "mode": "beta-capture",
                         "requestedLongEdge": videoLongEdge, "durationSeconds": captureSeconds,
                         "travelDistanceMeters": travelDistance, "farthestDistanceMeters": farthestDistance,
-                        "distanceSource": "arkit_tracking_estimate", "keyframeMinimumIntervalSeconds": 0.5,
+                        "distanceSource": "arkit_tracking_estimate", "savedImageCount": refinedRecords.count,
+                        "photoSampling": "all_recorded_video_frames",
+                        "photoQualityPolicy": "all_video_samples; quality_and_tracking_annotated; no_viewpoint_selection",
                         "cameraEstimationRequested": true, "rawCaptureCompleted": true]
                     try JSONSerialization.data(withJSONObject: captureInfo, options: [.prettyPrinted, .sortedKeys])
                         .write(to: dir.appendingPathComponent("beta-capture.json"), options: .atomic)
@@ -1497,7 +1525,13 @@ final class CaptureController: NSObject, ObservableObject {
                                lidarAvailable: supportsLiDAR,
                                lidarEnabled: hasLiDAR,
                                rgbReconstructionEnabled: !hasLiDAR && config.reconstructFromImages,
-                               streamCapture: StreamCaptureMeta())
+                               streamCapture: StreamCaptureMeta(),
+                               acquisitionPolicy: CaptureAcquisitionPolicy(
+                                photoSampling: isBetaCapture ? "all_recorded_video_frames" : "viewpoint_selection",
+                                photoMinimumIntervalSeconds: isBetaCapture ? 0 : config.minKeyframeInterval,
+                                photoQualityPolicy: isBetaCapture ? "all_video_samples; quality_and_tracking_annotated; no_viewpoint_selection" : "quality_gated",
+                                requestedMaxExposureSeconds: requestedMaxExposureSeconds,
+                                observedMaxExposureSeconds: cameraControls.observedMaxExposureSeconds))
         try ExportManager.writeMeta(meta, to: dir.appendingPathComponent(CaptureMetadata.fileName))
     }
 
@@ -1859,7 +1893,7 @@ extension CaptureController: @preconcurrency ARSessionDelegate {
         if needsCameraSetup {
             needsCameraSetup = false
             cameraFirstFrameTime = frame.timestamp
-            cameraControls.beginSession(limitExposure: !isBetaCapture)
+            cameraControls.beginSession(maxExposureSeconds: requestedMaxExposureSeconds)
         }
         if pendingCameraLock, phase == .scanning, lockCameraParams,
            let first = cameraFirstFrameTime, frame.timestamp - first >= 1,
@@ -1946,7 +1980,7 @@ extension CaptureController: @preconcurrency ARSessionDelegate {
         if frameCounter % 6 == 0 { captureSeconds = frame.timestamp - (captureFirstTimestamp ?? frame.timestamp) }
         recordContinuousFrame(frame)
         assessedScanFrames += 1
-        if a.captureBlocked || !sessionState.canCapture { blockedScanFrames += 1 }
+        if (!isBetaCapture && a.captureBlocked) || !sessionState.canCapture { blockedScanFrames += 1 }
         if ProcessInfo.processInfo.thermalState == .critical {
             scanNotice = L10n.text("裝置過熱，已停止掃描並保留資料。請等手機降溫後再繼續。")
             stopScan()
@@ -2002,6 +2036,9 @@ extension CaptureController: @preconcurrency ARSessionDelegate {
             visualizer?.placeDollhouse(pov: pov.simdWorldTransform)
         }
 
+        // Beta records every accepted video sample; encode its JPEG after recording.
+        // Preview/fusion keep their own quality rules, without selecting stored images.
+        guard !isBetaCapture else { return }
         guard a.allowCapture else {
             if a.blockReason == .focus,
                frame.timestamp - lastSharpnessRejectTime >= config.minKeyframeInterval,
@@ -2230,7 +2267,11 @@ extension CaptureController: @preconcurrency ARSessionDelegate {
                                           transform: MatrixUtil.rowMajor16(camera.transform),
                                           trackingState: streamTrackingState(camera.trackingState),
                                           depthFile: nil, confidenceFile: nil,
-                                          depthWidth: depthWidth, depthHeight: depthHeight)
+                                          depthWidth: depthWidth, depthHeight: depthHeight,
+                                          exposureDuration: frame.camera.exposureDuration,
+                                          exposureOffsetEV: Double(frame.camera.exposureOffset),
+                                          iso: cameraControls.currentISO,
+                                          estimatedBlurPx: Double(assessment.blurPixels))
         let packet = CaptureStreamPacket(manifest: manifest, color: color, depth: depth, confidence: confidence)
         if color != nil || depth != nil { continuousPendingMedia += 1 }
         let generation = scanGeneration
