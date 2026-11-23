@@ -970,3 +970,17 @@
 "差值用于比较两套估计，不代表真实误差或拍摄抖动。" = "This compares the two estimates; it does not measure absolute error or camera shake.";
 
 "重建包分文件夹保存两套参数，默认使用 RealityKit；当前预览和训练仍使用 ARKit。" = "The reconstruction package saves both camera sets in separate folders and defaults to RealityKit. Preview and training still use ARKit.";
+
+"仅导出 ARKit 位姿、对应图像和可选深度，不包含视频或摄影测量结果。" = "Export only ARKit poses, matching images and optional depth, without video or photogrammetry results.";
+"保存场景数据 ZIP" = "Save Scene Data ZIP";
+"此场景未采集 LiDAR，仅保存图像和相机位姿。" = "This scene has no LiDAR data; only images and camera poses are exported.";
+"当前预览、训练和场景数据导出均使用原始 ARKit 参数。" = "Preview, training and scene data exports use the original ARKit parameters.";
+
+"逐帧写入跟不上采集，已停止拍摄并保留已写入数据。" = "Full-frame writes cannot keep up. Capture stopped and written data was preserved.";
+"逐帧影像复制失败，已停止拍摄并保留已写入数据。" = "Full-frame image copy failed. Capture stopped and written data was preserved.";
+"原生视频 · 逐帧保存 ARKit 图像与参数" = "Native video · Save every ARKit image and camera frame";
+"同时保存全帧与 0.5 秒间隔抽帧数据，两份目录结构相同。" = "Save all frames plus a 0.5-second sampled copy, both with the same folder structure.";
+
+"正在写入 ZIP…" = "Writing ZIP…";
+"正在检查场景文件…" = "Checking scene files…";
+"正在整理导出文件…" = "Preparing export files…";

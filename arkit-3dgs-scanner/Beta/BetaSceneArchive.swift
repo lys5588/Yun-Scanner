@@ -2,16 +2,18 @@
 // Copyright 2026. See LICENSE and NOTICE.
 import Foundation
 import CryptoKit
+import zlib
 
 /// Serializes exports, stages every change, and never edits capture source files.
 actor BetaSceneArchive {
     static let shared = BetaSceneArchive()
-    enum Contents: String, Sendable { case reconstruction, original }
+    enum Contents: String, Sendable { case arkit, reconstruction, original }
     struct ArchiveError: LocalizedError {
         let message: String
         var errorDescription: String? { message }
     }
-    func save(directory: URL, includeLiDAR: Bool, contents: Contents = .reconstruction) throws -> URL {
+    func save(directory: URL, includeLiDAR: Bool, contents: Contents = .arkit,
+              progress: @Sendable @escaping (SceneExportProgress) -> Void = { _ in }) throws -> URL {
         let fm = FileManager.default
         let parent = directory.deletingLastPathComponent()
         let staging = parent.appendingPathComponent(".beta-export-" + UUID().uuidString, isDirectory: true)
@@ -19,12 +21,13 @@ actor BetaSceneArchive {
         let name = SceneInfo.read(in: directory)?.name
         let folder = name.map(Self.safeFolderName) ?? directory.lastPathComponent
         let mirror = staging.appendingPathComponent(folder, isDirectory: true)
-        try stage(directory: directory, to: mirror, includeLiDAR: includeLiDAR, contents: contents)
-        return try publish(mirror: mirror, parent: parent, name: folder + "-" + contents.rawValue)
+        try stage(directory: directory, to: mirror, includeLiDAR: includeLiDAR, contents: contents, progress: progress)
+        return try publish(mirror: mirror, parent: parent, name: folder + "-" + contents.rawValue, progress: progress)
     }
 
     /// One ZIP with one named folder per scene. No nested scene ZIPs and no partial success.
-    func saveBatch(entries: [ScanEntry], includeLiDAR: Bool, contents: Contents = .reconstruction) throws -> URL {
+    func saveBatch(entries: [ScanEntry], includeLiDAR: Bool, contents: Contents = .arkit,
+              progress: @Sendable @escaping (SceneExportProgress) -> Void = { _ in }) throws -> URL {
         let fm = FileManager.default
         guard let first = entries.first else { throw ArchiveError(message: L10n.text("请先选择场景。")) }
         let parent = first.directory.deletingLastPathComponent().standardizedFileURL.resolvingSymlinksInPath()
@@ -42,7 +45,7 @@ actor BetaSceneArchive {
         try fm.createDirectory(at: batch, withIntermediateDirectories: true)
         var used: Set<String> = ["batch-manifest.json"]
         var index: [[String: Any]] = []
-        for entry in entries {
+        for (entryIndex, entry) in entries.enumerated() {
             try Task.checkCancellation()
             let base = Self.safeFolderName(entry.displayName)
             var folder = base, suffix = 2
@@ -50,13 +53,15 @@ actor BetaSceneArchive {
                 folder = base + " (\(suffix))"; suffix += 1
             }
             let depth = includeLiDAR && entry.usedLiDAR == true
-            do { try stage(directory: entry.directory, to: batch.appendingPathComponent(folder), includeLiDAR: depth, contents: contents) }
+            do { try stage(directory: entry.directory, to: batch.appendingPathComponent(folder), includeLiDAR: depth, contents: contents) { value in
+                progress(SceneExportProgress(fraction: (Double(entryIndex) * 0.5 + value.fraction) / Double(entries.count), message: value.message))
+            } }
             catch { throw ArchiveError(message: entry.displayName + ": " + error.localizedDescription) }
             index.append(["sceneID": entry.id, "sceneName": entry.displayName, "folder": folder, "includesLiDAR": depth])
         }
         try JSONSerialization.data(withJSONObject: ["schemaVersion": 2, "kind": "beta-scene-batch", "contents": contents.rawValue, "scenes": index], options: [.prettyPrinted, .sortedKeys])
             .write(to: batch.appendingPathComponent("batch-manifest.json"), options: .atomic)
-        return try publish(mirror: batch, parent: parent, name: "Scenes-" + contents.rawValue)
+        return try publish(mirror: batch, parent: parent, name: "Scenes-" + contents.rawValue, progress: progress)
     }
 
     nonisolated static func safeFolderName(_ name: String) -> String {
@@ -71,15 +76,18 @@ actor BetaSceneArchive {
         return shortened.isEmpty ? "Scene" : shortened
     }
 
-    private func publish(mirror: URL, parent: URL, name: String) throws -> URL {
+    private func publish(mirror: URL, parent: URL, name: String, progress: @Sendable (SceneExportProgress) -> Void) throws -> URL {
         try Task.checkCancellation()
-        let archive = try ExportManager.makeArchive(of: mirror)
-        try markUTF8Names(in: archive)
+        let archive = mirror.deletingLastPathComponent().appendingPathComponent("archive.partial")
+        try SceneZipWriter.archive(mirror, to: archive) { fraction in
+            progress(SceneExportProgress(fraction: 0.5 + fraction * 0.49, message: L10n.text("正在写入 ZIP…")))
+        }
         try Task.checkCancellation()
         let exports = parent.appendingPathComponent("exports", isDirectory: true)
         try FileManager.default.createDirectory(at: exports, withIntermediateDirectories: true)
         let target = exports.appendingPathComponent(name + "-" + UUID().uuidString.prefix(8) + ".zip")
         try FileManager.default.moveItem(at: archive, to: target)
+        progress(SceneExportProgress(fraction: 1, message: L10n.text("场景 ZIP 已保存")))
         return target
     }
 
@@ -168,12 +176,17 @@ actor BetaSceneArchive {
         try file.synchronize()
     }
 
-    private func stage(directory: URL, to mirror: URL, includeLiDAR: Bool, contents: Contents) throws {
-        if contents == .reconstruction {
+    private func stage(directory: URL, to mirror: URL, includeLiDAR: Bool, contents: Contents,
+                       progress: @Sendable (SceneExportProgress) -> Void = { _ in }) throws {
+        progress(SceneExportProgress(fraction: 0, message: L10n.text("正在检查场景文件…")))
+        if contents == .arkit && !FileManager.default.fileExists(atPath: directory.appendingPathComponent("video-import.json").path) {
+            try BetaReconstructionExport.stageARKit(directory: directory, to: mirror, includeLiDAR: includeLiDAR, progress: progress)
+        } else if contents == .reconstruction {
             try BetaReconstructionExport.stage(directory: directory, to: mirror, includeLiDAR: includeLiDAR)
         } else {
             try stageOriginal(directory: directory, to: mirror, includeLiDAR: includeLiDAR)
         }
+        progress(SceneExportProgress(fraction: 0.5, message: L10n.text("正在写入 ZIP…")))
     }
     private func stageOriginal(directory: URL, to mirror: URL, includeLiDAR: Bool) throws {
         let fm = FileManager.default
@@ -294,5 +307,85 @@ actor BetaSceneArchive {
         try writeLine(pending)
         try output.synchronize()
         _ = try FileManager.default.replaceItemAt(url, withItemAt: temporary)
+    }
+}
+
+/// Work progress, never a timer-based estimate. 1 is emitted only after atomic publication.
+nonisolated struct SceneExportProgress: Sendable {
+    var fraction: Double
+    var message: String
+}
+
+/// Bounded-memory ZIP64 writer. Store already encoded media without recompression.
+nonisolated enum SceneZipWriter {
+    static func archive(_ root: URL, to target: URL, progress: @Sendable (Double) -> Void) throws {
+        let fm = FileManager.default
+        guard let iterator = fm.enumerator(atPath: root.path) else {
+            throw BetaSceneArchive.ArchiveError(message: "Cannot enumerate export")
+        }
+        var files: [(URL, UInt64, String)] = []
+        for case let relative as String in iterator {
+            let url = root.appendingPathComponent(relative)
+            let values = try url.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey])
+            guard values.isSymbolicLink != true else { throw BetaSceneArchive.ArchiveError(message: "Symbolic link in export") }
+            if values.isRegularFile == true { files.append((url, UInt64(values.fileSize!), relative)) }
+        }
+        files.sort { $0.0.path < $1.0.path }
+        let total = files.reduce(UInt64(0)) { $0 + $1.1 }
+        guard fm.createFile(atPath: target.path, contents: nil) else { throw CocoaError(.fileWriteUnknown) }
+        let out = try FileHandle(forWritingTo: target)
+        defer { try? out.close() }
+        var central = Data(), written: UInt64 = 0, lastPercent = -1
+        func extra(_ size: UInt64, _ offset: UInt64? = nil) -> Data {
+            var d = Data(); d.appendLE(UInt16(1)); d.appendLE(UInt16(offset == nil ? 16 : 24))
+            d.appendLE(size); d.appendLE(size); if let offset { d.appendLE(offset) }; return d
+        }
+        for (url, size, relative) in files {
+            try Task.checkCancellation()
+            let name = Data((root.lastPathComponent + "/" + relative).utf8)
+            guard name.count <= Int(UInt16.max) else { throw CocoaError(.fileWriteInvalidFileName) }
+            let offset = try out.offset()
+            var local = Data(); local.appendLE(UInt32(0x04034b50)); local.appendLE(UInt16(45)); local.appendLE(UInt16(0x0800))
+            local.appendLE(UInt16(0)); local.appendLE(UInt16(0)); local.appendLE(UInt16(0x21)); local.appendLE(UInt32(0))
+            local.appendLE(UInt32.max); local.appendLE(UInt32.max); local.appendLE(UInt16(name.count)); local.appendLE(UInt16(20))
+            local.append(name); local.append(extra(size)); try out.write(contentsOf: local)
+            let input = try FileHandle(forReadingFrom: url)
+            var crc: uLong = 0, count: UInt64 = 0
+            do {
+                while true {
+                    // Foundation may autorelease NSData behind FileHandle reads. Actor work
+                    // has no per-chunk run-loop drain: ARC scope alone is insufficient.
+                    let chunkSize: Int = try autoreleasepool {
+                        try Task.checkCancellation()
+                        guard let chunk = try input.read(upToCount: 1024 * 1024), !chunk.isEmpty else { return 0 }
+                        crc = chunk.withUnsafeBytes { crc32(crc, $0.bindMemory(to: Bytef.self).baseAddress, uInt(chunk.count)) }
+                        try out.write(contentsOf: chunk); count += UInt64(chunk.count); written += UInt64(chunk.count)
+                        let percent = Int(Double(written) / Double(max(1, total)) * 100)
+                        if percent != lastPercent { progress(Double(written) / Double(max(1, total))); lastPercent = percent }
+                        return chunk.count
+                    }
+                    if chunkSize == 0 { break }
+                }
+                try input.close()
+            } catch { try? input.close(); throw error }
+            guard count == size else { throw CocoaError(.fileReadCorruptFile) }
+            let end = try out.offset(); try out.seek(toOffset: offset + 14)
+            var checksum = Data(); checksum.appendLE(UInt32(crc)); try out.write(contentsOf: checksum); try out.seek(toOffset: end)
+            central.appendLE(UInt32(0x02014b50)); central.appendLE(UInt16(45)); central.appendLE(UInt16(45))
+            central.appendLE(UInt16(0x0800)); central.appendLE(UInt16(0)); central.appendLE(UInt16(0)); central.appendLE(UInt16(0x21))
+            central.appendLE(UInt32(crc)); central.appendLE(UInt32.max); central.appendLE(UInt32.max)
+            central.appendLE(UInt16(name.count)); central.appendLE(UInt16(28)); central.appendLE(UInt16(0))
+            central.appendLE(UInt16(0)); central.appendLE(UInt16(0)); central.appendLE(UInt32(0)); central.appendLE(UInt32.max)
+            central.append(name); central.append(extra(size, offset))
+        }
+        let centralOffset = try out.offset(); try out.write(contentsOf: central)
+        let endOffset = try out.offset()
+        var end = Data(); end.appendLE(UInt32(0x06064b50)); end.appendLE(UInt64(44)); end.appendLE(UInt16(45)); end.appendLE(UInt16(45))
+        end.appendLE(UInt32(0)); end.appendLE(UInt32(0)); end.appendLE(UInt64(files.count)); end.appendLE(UInt64(files.count))
+        end.appendLE(UInt64(central.count)); end.appendLE(centralOffset)
+        end.appendLE(UInt32(0x07064b50)); end.appendLE(UInt32(0)); end.appendLE(endOffset); end.appendLE(UInt32(1))
+        end.appendLE(UInt32(0x06054b50)); end.appendLE(UInt16(0)); end.appendLE(UInt16(0))
+        end.appendLE(UInt16.max); end.appendLE(UInt16.max); end.appendLE(UInt32.max); end.appendLE(UInt32.max); end.appendLE(UInt16(0))
+        try out.write(contentsOf: end); try out.synchronize()
     }
 }

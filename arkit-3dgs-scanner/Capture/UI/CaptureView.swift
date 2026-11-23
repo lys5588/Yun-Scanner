@@ -46,7 +46,7 @@ struct CaptureView: View {
                     .ignoresSafeArea()
                     .id(controller.reviewPoints.count)   // 續掃後重新處理 → 重建場景
             }
-            if controller.phase == .processing {
+            if controller.phase == .processing && !isBeta {
                 FusionProcessingView(progress: controller.exportProgress,
                                      stage: controller.processingStage,
                                      detail: controller.statusText,
@@ -60,6 +60,7 @@ struct CaptureView: View {
                 }
             } else if isBeta {
                 BetaCaptureHUD(controller: controller, locationRecorder: locationRecorder)
+                    .disabled(controller.phase == .processing)
             } else {
                 HUDOverlay(controller: controller,
                            onResetView: showReview ? { reviewCameraReset += 1 } : nil,

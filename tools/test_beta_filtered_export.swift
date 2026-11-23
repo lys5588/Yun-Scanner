@@ -6,6 +6,13 @@ import CoreGraphics
 import ImageIO
 import UniformTypeIdentifiers
 
+final class ExportProgressProbe: @unchecked Sendable {
+    private let lock = NSLock()
+    private var values: [Double] = []
+    func append(_ value: SceneExportProgress) { lock.lock(); defer { lock.unlock() }; values.append(value.fraction) }
+    func snapshot() -> [Double] { lock.lock(); defer { lock.unlock() }; return values }
+}
+
 /// Synthetic export-policy tests; these do not measure camera accuracy.
 enum BetaFilteredExportTests {
     static func check(_ value: Bool, _ message: String) throws { try BetaSceneTests.expect(value,message) }
@@ -96,8 +103,135 @@ enum BetaFilteredExportTests {
             "worldCoordinates":"original ARKit world, meters, gravity-aligned Y-up",
             "alignment":["inlierIDs":cameras.map { $0["id"] as! Int }.filter { $0 != 5 },"rejectedIDs":[5]],"depthFrameIDs":Array(1...12)]
         try json(report,reportURL)
+        // The default downstream export works without any photogrammetry report.
+        try fm.removeItem(at: reportURL)
+        var allOriginals = originals
+        var allFrames = frames
+        for index in allOriginals.indices {
+            allOriginals[index]["timestamp"] = 40.1 + Double(index) * 0.1
+            allFrames[index]["timestamp"] = allOriginals[index]["timestamp"]
+        }
+        try rows(allFrames, scene.appendingPathComponent("frames.jsonl"))
+        allOriginals[11]["transform"] = frames[11]["transform"]
+        for key in ["depthFile", "confidenceFile", "depthWidth", "depthHeight"] { allOriginals[7].removeValue(forKey: key) }
+        try rows(allOriginals, scene.appendingPathComponent("poses.jsonl"))
+        try pixels.write(to: scene.appendingPathComponent("images/7.jpg"))
+        let compactBefore = try hashes(scene)
+        let probe = ExportProgressProbe()
+        let compactZIP = try await BetaSceneArchive.shared.save(directory: scene, includeLiDAR: true) { probe.append($0) }
+        let progressValues = probe.snapshot()
+        try check(progressValues.first == 0 && progressValues.last == 1, "progress must start at zero and finish after publication")
+        try check(zip(progressValues, progressValues.dropFirst()).allSatisfy { $0 <= $1 }, "export progress decreased")
+        try check(progressValues.contains { $0 > 0.5 && $0 < 1 }, "ZIP bytes must report intermediate progress")
+        let compactRoot = root.appendingPathComponent("compact")
+        try BetaSceneTests.unpack(compactZIP, to: compactRoot)
+        let compact = compactRoot.appendingPathComponent("scan_policy")
+        let compactFrames = try readRows(compact.appendingPathComponent("arkit/frames.jsonl"))
+        let compactPoses = try readRows(compact.appendingPathComponent("arkit/poses.jsonl"))
+        let compactIDs = compactPoses.map { $0["id"] as! Int }
+        try check(compactIDs == Array(1...12), "ARKit export incorrectly depends on estimated cameras")
+        try check(compactFrames.map { $0["id"] as! Int } == compactIDs, "compact frame and pose IDs differ")
+        var allowed = Set(["scene-package.json", "arkit/frames.jsonl", "arkit/poses.jsonl"])
+        for (frame, pose) in zip(compactFrames, compactPoses) {
+            let id = pose["id"] as! Int
+            let image = "images/" + (pose["imageFile"] as! String)
+            allowed.insert(image)
+            try check(try Data(contentsOf: compact.appendingPathComponent(image)) == pixels, "JPEG bytes changed")
+            if id != 8 {
+                let depthPath = frame["depthFile"] as! String, confidencePath = frame["confidenceFile"] as! String
+                allowed.formUnion([depthPath, confidencePath])
+                try check(depthPath == "depth/frame_\(id).f32" && confidencePath == "depth/frame_\(id).u8", "compact depth extensions")
+                try check(try Data(contentsOf: compact.appendingPathComponent(depthPath)) == depth, "depth bytes changed")
+                let expectedConfidence = id == 9 ? Data(repeating: 3, count: 12) : confidence
+                try check(try Data(contentsOf: compact.appendingPathComponent(confidencePath)) == expectedConfidence, "confidence bytes changed")
+            } else {
+                try check(frame["depthStatus"] as? String == "not_captured" && frame["depthFile"] == nil, "missing depth must retain the frame")
+            }
+            try check(pose["transform"] as? [Double] == allOriginals[id-1]["transform"] as? [Double], "original ARKit pose changed")
+            try check(pose["depthFile"] == nil, "depth references must live in frames")
+        }
+        let sampled = compact.appendingPathComponent("sampled_0.5s")
+        let sampledPoses = try readRows(sampled.appendingPathComponent("arkit/poses.jsonl"))
+        let sampledFrames = try readRows(sampled.appendingPathComponent("arkit/frames.jsonl"))
+        try check(sampledPoses.map { $0["id"] as! Int } == [1,6,11], "0.5 second subset must use original timestamps and keep original IDs")
+        try check(sampledFrames.map { $0["id"] as! Int } == [1,6,11], "sampled frame and pose IDs differ")
+        allowed.formUnion(["sampled_0.5s/scene-package.json", "sampled_0.5s/arkit/frames.jsonl", "sampled_0.5s/arkit/poses.jsonl"])
+        for (frame, pose) in zip(sampledFrames, sampledPoses) {
+            let id = pose["id"] as! Int
+            try check(NSDictionary(dictionary: pose).isEqual(to: compactPoses[id-1]), "sampled camera parameters changed")
+            try check(NSDictionary(dictionary: frame).isEqual(to: compactFrames[id-1]), "sampled frame metadata changed")
+            for path in ["images/" + (frame["imageFile"] as! String), frame["depthFile"] as! String, frame["confidenceFile"] as! String] {
+                allowed.insert("sampled_0.5s/" + path)
+                try check(try Data(contentsOf: sampled.appendingPathComponent(path)) == Data(contentsOf: compact.appendingPathComponent(path)), "sampled media must preserve full-frame bytes")
+            }
+        }
+        let sampledManifest = try read(sampled.appendingPathComponent("scene-package.json"))
+        try check(sampledManifest["samplingIntervalSeconds"] as? Double == 0.5 && sampledManifest["sourceFrameCount"] as? Int == 12 && sampledManifest["frameCount"] as? Int == 3, "sampled manifest counts and interval")
+        let exportedPaths = Set(try (fm.enumerator(atPath: compact.path)!.allObjects as! [String]).filter {
+            try compact.appendingPathComponent($0).resourceValues(forKeys: [.isRegularFileKey]).isRegularFile == true
+        })
+        try check(exportedPaths == allowed, "compact export file mismatch: \(exportedPaths.sorted()) expected \(allowed.sorted())")
+        try check(compactFrames[2]["videoWritten"] as? Bool == false, "video backpressure must not discard the saved image")
+        try check(compactFrames[5]["trackingState"] as? String == "limited", "limited tracking must retain the frame and its status")
+        try check(compactPoses[9]["blurVerdict"] as? String == "demote", "blur assessment must not discard the frame")
+        let exportsFolder = scene.deletingLastPathComponent().appendingPathComponent("exports")
+        let exportsBeforeFailure = try fm.contentsOfDirectory(atPath: exportsFolder.path).count
+        try Data("broken JPEG".utf8).write(to: scene.appendingPathComponent("images/1.jpg"))
+        let failureProbe = ExportProgressProbe()
+        do {
+            _ = try await BetaSceneArchive.shared.save(directory: scene, includeLiDAR: false) { failureProbe.append($0) }
+            throw NSError(domain: "missing source media silently filtered", code: 1)
+        } catch is BetaReconstructionExport.ExportError { }
+        try check(!failureProbe.snapshot().contains(1), "failed export must not reach 100 percent")
+        try check(try fm.contentsOfDirectory(atPath: exportsFolder.path).count == exportsBeforeFailure, "full-frame failure published partial export")
+        try pixels.write(to: scene.appendingPathComponent("images/1.jpg"))
+        let compactManifest = try read(compact.appendingPathComponent("scene-package.json"))
+        try check(compactManifest["poseFile"] as? String == "arkit/poses.jsonl" && compactManifest["frameFile"] as? String == "arkit/frames.jsonl", "compact manifest paths")
+        let compactRGB = try await BetaSceneArchive.shared.save(directory: scene, includeLiDAR: false)
+        try BetaSceneTests.unpack(compactRGB, to: root.appendingPathComponent("compact-rgb"))
+        let rgbCompact = root.appendingPathComponent("compact-rgb/scan_policy")
+        try check(!fm.fileExists(atPath: rgbCompact.appendingPathComponent("depth").path), "compact RGB leaked depth")
+        let rgbFrames = try readRows(rgbCompact.appendingPathComponent("arkit/frames.jsonl"))
+        try check(rgbFrames.count == 12 && rgbFrames.allSatisfy { $0["depthFile"] == nil && $0["confidenceFile"] == nil }, "compact RGB frame policy")
+        try check(!fm.fileExists(atPath: rgbCompact.appendingPathComponent("sampled_0.5s/depth").path), "sampled RGB leaked depth")
+        try check(try readRows(rgbCompact.appendingPathComponent("sampled_0.5s/arkit/poses.jsonl")).count == 3, "RGB sample count")
+        try check(try hashes(scene) == compactBefore, "compact export changed source")
+        // Stop-time preparation is allowed before processing is marked completed.
+        try json(["status": "processing"], scene.appendingPathComponent("capture-processing.json"))
+        let rawBeforeSample = try hashes(scene)
+        try BetaReconstructionExport.prepareCaptureSample(directory: scene, includeLiDAR: true)
+        let persistedSample = scene.appendingPathComponent("sampled_0.5s")
+        try check(try readRows(persistedSample.appendingPathComponent("arkit/poses.jsonl")).map { $0["id"] as! Int } == [1,6,11], "stop-time sample IDs")
+        let rawAfterSample = try hashes(scene).filter { !$0.key.contains("/sampled_0.5s/") }
+        try check(rawBeforeSample == rawAfterSample, "stop-time sampling changed original data")
+        let sampleBeforeExport = try hashes(persistedSample)
+        do {
+            try BetaReconstructionExport.prepareCaptureSample(directory: scene, includeLiDAR: true)
+            throw NSError(domain: "existing sample overwritten", code: 1)
+        } catch is BetaReconstructionExport.ExportError { }
+        try json(["status": "completed"], scene.appendingPathComponent("capture-processing.json"))
+        let compactEntries = try await ScanLibrary(root: root).entries()
+        let compactBatch = try await BetaSceneArchive.shared.saveBatch(entries: compactEntries, includeLiDAR: true)
+        try BetaSceneTests.unpack(compactBatch, to: root.appendingPathComponent("compact-batch"))
+        let batchRoot = root.appendingPathComponent("compact-batch/Scenes")
+        let batchIndex = try read(batchRoot.appendingPathComponent("batch-manifest.json"))["scenes"] as! [[String: Any]]
+        try check(batchIndex.count == 1, "compact batch scene count")
+        let compactBatchScene = batchRoot.appendingPathComponent(batchIndex[0]["folder"] as! String)
+        try check(try readRows(compactBatchScene.appendingPathComponent("arkit/poses.jsonl")).count == 12, "default batch must use compact ARKit export")
+        try check(try readRows(compactBatchScene.appendingPathComponent("sampled_0.5s/arkit/poses.jsonl")).count == 3, "batch must include sampled package")
+        try check(try hashes(persistedSample) == sampleBeforeExport, "export modified persisted sample")
+        try fm.removeItem(at: persistedSample)
+        try rows([allOriginals[0]], scene.appendingPathComponent("poses.jsonl"))
+        let shortZIP = try await BetaSceneArchive.shared.save(directory: scene, includeLiDAR: false)
+        try BetaSceneTests.unpack(shortZIP, to: root.appendingPathComponent("short"))
+        try check(try readRows(root.appendingPathComponent("short/scan_policy/sampled_0.5s/arkit/poses.jsonl")).count == 1, "short capture must retain the first frame")
+        try rows(originals, scene.appendingPathComponent("poses.jsonl"))
+        try rows(frames, scene.appendingPathComponent("frames.jsonl"))
+        try Data("bad JPEG".utf8).write(to: scene.appendingPathComponent("images/7.jpg"))
+        try json(report, reportURL)
+        print("PASS: all-frame ARKit export without photogrammetry; retains blur/limited/video-drop/missing-depth frames; exact allowlist, shared IDs, original bytes, atomic failure, F32/U8, RGB and batch export")
         let before = try hashes(scene)
-        let zip = try await BetaSceneArchive.shared.save(directory:scene,includeLiDAR:true)
+        let zip = try await BetaSceneArchive.shared.save(directory:scene,includeLiDAR:true,contents:.reconstruction)
         try BetaSceneTests.unpack(zip,to:root.appendingPathComponent("unpacked"))
         let output = root.appendingPathComponent("unpacked/scan_policy")
         for path in ["arkit/poses.jsonl","realitykit/poses.jsonl","frames.jsonl"] {
@@ -122,7 +256,7 @@ enum BetaFilteredExportTests {
         try check(try fm.contentsOfDirectory(atPath:output.appendingPathComponent("images").path).count == 3,"rejected image leaked")
         try check(try fm.contentsOfDirectory(atPath:output.appendingPathComponent("depth").path).count == 6,"rejected depth leaked")
         try check(try hashes(scene) == before,"export modified original data")
-        let rgb = try await BetaSceneArchive.shared.save(directory:scene,includeLiDAR:false)
+        let rgb = try await BetaSceneArchive.shared.save(directory:scene,includeLiDAR:false,contents:.reconstruction)
         try BetaSceneTests.unpack(rgb,to:root.appendingPathComponent("rgb"))
         let rgbOutput = root.appendingPathComponent("rgb/scan_policy")
         try check(!fm.fileExists(atPath:rgbOutput.appendingPathComponent("depth").path),"depth leaked into RGB-only export")
@@ -142,14 +276,14 @@ enum BetaFilteredExportTests {
             case "unsafe": invalid["cameraFile"] = "../outside.jsonl"; try json(invalid,reportURL)
             default: invalid["alignment"] = ["inlierIDs":[1],"rejectedIDs":[5]]; try json(invalid,reportURL)
             }
-            do { _ = try await BetaSceneArchive.shared.save(directory:scene,includeLiDAR:true); throw NSError(domain:"invalid report accepted: "+bad,code:1) }
+            do { _ = try await BetaSceneArchive.shared.save(directory:scene,includeLiDAR:true,contents:.reconstruction); throw NSError(domain:"invalid report accepted: "+bad,code:1) }
             catch is BetaReconstructionExport.ExportError { }
             try json(report,reportURL)
         }
         let second = root.appendingPathComponent("scan_incomplete")
         try fm.copyItem(at:scene,to:second); try fm.removeItem(at:second.appendingPathComponent("camera-estimation.json"))
         let entries = try await ScanLibrary(root:root).entries()
-        do { _ = try await BetaSceneArchive.shared.saveBatch(entries:entries,includeLiDAR:true); throw NSError(domain:"partial batch published",code:1) }
+        do { _ = try await BetaSceneArchive.shared.saveBatch(entries:entries,includeLiDAR:true,contents:.reconstruction); throw NSError(domain:"partial batch published",code:1) }
         catch is BetaSceneArchive.ArchiveError { }
         try check(try fm.contentsOfDirectory(atPath:exports.path).count == exportCount,"failure published archive")
         try check(try !fm.contentsOfDirectory(atPath:root.path).contains { $0.hasPrefix(".beta-export-") },"staging leaked")
@@ -160,7 +294,7 @@ enum BetaFilteredExportTests {
         for id in 1...2 { try pixels.write(to:video.appendingPathComponent("images/\(id).jpg")) }
         try rows(Array(originals.prefix(2)),video.appendingPathComponent("poses.jsonl"))
         try json(["metricScale":false,"unit":"arbitrary_photogrammetry_unit_normalized"],video.appendingPathComponent("video-import.json"))
-        let videoZIP = try await BetaSceneArchive.shared.save(directory:video,includeLiDAR:false)
+        let videoZIP = try await BetaSceneArchive.shared.save(directory:video,includeLiDAR:false,contents:.reconstruction)
         try BetaSceneTests.unpack(videoZIP,to:root.appendingPathComponent("video"))
         let videoOutput = root.appendingPathComponent("video/scan_video")
         let videoManifest = try read(videoOutput.appendingPathComponent("scene-package.json"))
@@ -171,7 +305,7 @@ enum BetaFilteredExportTests {
         for i in originals.indices { originals[i]["blurVerdict"] = "reject" }
         try rows(originals,scene.appendingPathComponent("poses.jsonl"))
         report["sourcePosesSHA256"] = try hash(scene.appendingPathComponent("poses.jsonl")); try json(report,reportURL)
-        do { _ = try await BetaSceneArchive.shared.save(directory:scene,includeLiDAR:true); throw NSError(domain:"zero frames exported",code:1) }
+        do { _ = try await BetaSceneArchive.shared.save(directory:scene,includeLiDAR:true,contents:.reconstruction); throw NSError(domain:"zero frames exported",code:1) }
         catch is BetaReconstructionExport.ExportError { }
         print("PASS: filtered export intersection, dropped/tracking/quality/pose/image/depth exclusions, aligned membership, common IDs, allowlist, original hashes, RGB policy, failure atomicity, non-metric video")
     }

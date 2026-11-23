@@ -95,7 +95,7 @@ struct BetaCaptureHUD: View {
                 .accessibilityLabel(recording ? L10n.text("停止拍摄") : L10n.text("开始拍摄"))
                 .accessibilityIdentifier("betaRecord")
                 .accessibilityHint(controller.sessionState.message)
-            Text(recording ? L10n.text("停止后整理位姿并进入预览") : L10n.text("原生视频 · 自动保存关键帧"))
+            Text(recording ? L10n.text("停止后整理位姿并进入预览") : L10n.text("原生视频 · 逐帧保存 ARKit 图像与参数"))
                 .font(.caption).foregroundStyle(.secondary)
         }.padding(20).padding(.bottom, 12)
             .background { if !available { DS.Palette.canvas.ignoresSafeArea() } }

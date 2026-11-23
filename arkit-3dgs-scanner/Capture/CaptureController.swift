@@ -182,13 +182,14 @@ final class CaptureController: NSObject, ObservableObject {
         config.pointCloudFloorPlan = false
         config.useSceneMesh = false
         config.cameraOnlyPoseRefinement = false
-        // A forgiving acquisition preset. Tracking loss still blocks invalid keyframes.
+        // Assess quality for diagnostics; Beta saves every delivered frame without shutter gating.
         config.maxBlurPixels = 32
         config.blockBlurPixels = 64
         config.keyframeMaxAngularSpeedRadS = 3
         config.keyframeMaxLinearSpeedMS = 3
         config.minSharpnessRatio = 0.25
-        config.minKeyframeInterval = 0.5
+        config.minKeyframeInterval = 0
+        config.maxPendingWrites = 8
     }
     func toggleVideoQuality() {
         guard phase == .idle, supports4K else { return }
@@ -787,6 +788,7 @@ final class CaptureController: NSObject, ObservableObject {
                 arView?.session.pause()
                 monitor.stop()
                 guard let dir = sessionDir, !refinedRecords.isEmpty,
+                      refinedRecords.count == continuousFrameIndex,
                       streamTerminalFailure == nil, !streamMetadataWriteFailed else {
                     scanNotice = L10n.text("采集未完成，请保留原始数据并重试。")
                     return
@@ -798,21 +800,23 @@ final class CaptureController: NSObject, ObservableObject {
                     let captureInfo: [String: Any] = ["schemaVersion": 1, "mode": "beta-capture",
                         "requestedLongEdge": videoLongEdge, "durationSeconds": captureSeconds,
                         "travelDistanceMeters": travelDistance, "farthestDistanceMeters": farthestDistance,
-                        "distanceSource": "arkit_tracking_estimate", "keyframeMinimumIntervalSeconds": 0.5,
-                        "cameraEstimationRequested": true, "rawCaptureCompleted": true]
+                        "distanceSource": "arkit_tracking_estimate", "keyframeMinimumIntervalSeconds": 0, "frameRetentionPolicy": "every_delivered_arkit_frame",
+                        "inputARFrameCount": continuousFrameIndex, "savedImageFrameCount": refinedRecords.count,
+                        "cameraEstimationRequested": false, "rawCaptureCompleted": true]
                     try JSONSerialization.data(withJSONObject: captureInfo, options: [.prettyPrinted, .sortedKeys])
                         .write(to: dir.appendingPathComponent("beta-capture.json"), options: .atomic)
                     reviewPoints = points
                     reviewTrajectory = refinedRecords.map { RefusionEngine.float4x4(rowMajor: $0.transform) }
-                    statusText = L10n.text("正在估计相机参数…")
-                    // RealityKit may use GPU. This Beta stage remains foreground-only;
-                    // it must never inherit the reconstruction path's CPU background grant.
-                    _ = try await CapturePhotogrammetry.run(directory: dir) { [self] fraction in
-                        Task { @MainActor [self] in
-                            guard self.isAttached, self.scanGeneration == generation else { return }
-                            self.exportProgress = 0.1 + fraction * 0.9
-                        }
+                    // Generate only the derived 0.5 s package after all original writes drain.
+                    // Existing scenes are never visited or backfilled by this path.
+                    let saveSampleDepth = hasLiDAR && config.saveDepth
+                    let sampleTask = Task.detached(priority: .utility) {
+                        try BetaReconstructionExport.prepareCaptureSample(directory: dir, includeLiDAR: saveSampleDepth)
                     }
+                    try await withTaskCancellationHandler {
+                        try await sampleTask.value
+                    } onCancel: { sampleTask.cancel() }
+                    // Finish the raw ARKit capture without starting optional photogrammetry.
                     guard !cancel.isCancelled, !Task.isCancelled, isAttached, generation == scanGeneration else { return }
                     exportProgress = 1
                     statusText = nil
@@ -1952,6 +1956,20 @@ extension CaptureController: @preconcurrency ARSessionDelegate {
             stopScan()
             return
         }
+        if isBetaCapture {
+            guard phase == .scanning else { return }
+            guard pendingWrites < config.maxPendingWrites else {
+                capturePerformance.writerBackpressureFrames += 1
+                markStreamFailure("full-frame JPEG queue capacity exceeded; capture stopped without silent subsampling")
+                scanNotice = L10n.text("逐帧写入跟不上采集，已停止拍摄并保留已写入数据。")
+                stopScan()
+                return
+            }
+            capturePerformance.photoCandidates += 1
+            if frameCounter % 6 == 0 { integratePreview(frame, blurPixels: a.blurPixels) }
+            captureKeyframe(frame, assessment: a)
+            return
+        }
         guard sessionState.canCapture else { return }
 
         // 遮斷級警告觸覺回饋（限流 1 次 / 1.5 秒）
@@ -2287,6 +2305,11 @@ extension CaptureController: @preconcurrency ARSessionDelegate {
         guard let pool = pixelBufferPool,
               let copy = PixelBufferUtil.clone(src, pool: pool) else {
             capturePerformance.imageCopyFailures += 1
+            if isBetaCapture {
+                markStreamFailure("full-frame image copy failed")
+                scanNotice = L10n.text("逐帧影像复制失败，已停止拍摄并保留已写入数据。")
+                stopScan()
+            }
             return
         }
 
@@ -2334,7 +2357,7 @@ extension CaptureController: @preconcurrency ARSessionDelegate {
                                 record: record)
 
         // 掛錨點：ARKit 後續的地圖優化會調整它，停止時讀回 = 修正後姿態
-        if let session = arView?.session {
+        if !isBetaCapture, let session = arView?.session {
             let anchor = ARAnchor(name: name, transform: camera.transform)
             session.add(anchor: anchor)
             keyframeAnchors[frameIndex] = anchor.identifier
@@ -2370,7 +2393,7 @@ extension CaptureController: @preconcurrency ARSessionDelegate {
                 arFramePacing.setPhotos(keyframeCount)
                 if !isInBackground { visualizer?.addKeyframe(pose: keyframe.c2w) }
                 revisitGuide.addPhoto(cameraToWorld: keyframe.c2w)
-                if phase == .scanning { captureHaptic.impactOccurred(intensity: 0.6) }
+                if phase == .scanning && !isBetaCapture { captureHaptic.impactOccurred(intensity: 0.6) }
             } catch {
                 guard generation == scanGeneration, isAttached else { return }
                 if let id = keyframeAnchors.removeValue(forKey: record.id),

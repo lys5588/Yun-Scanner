@@ -87,8 +87,12 @@ final class ContinuedProcessingLease {
         Task.detached(priority: .userInitiated) { [weak self] in
             guard let self else { return }
             do {
+                #if compiler(>=6.4)
                 if #available(iOS 27.0, *) { try await BGTaskScheduler.shared.submitTaskRequest(envelope.request) }
                 else { try BGTaskScheduler.shared.submit(envelope.request) }
+                #else
+                try BGTaskScheduler.shared.submit(envelope.request)
+                #endif
                 await MainActor.run {
                     if self.identifier != id { BGTaskScheduler.shared.cancel(taskRequestWithIdentifier: id) }
                 }

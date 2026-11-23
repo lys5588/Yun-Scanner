@@ -96,6 +96,40 @@ python3 tools/package_project.py --minimal
 
 ## 3. 当前真实状态
 
+2026-11-12 导出内存修复版已安装：Release 构建、严格签名及描述文件有效期检查通过，原 Team / Bundle ID 原位安装到“云山”，devicectl 启动成功并确认 PID 2522。未卸载 App，未操作原始场景文件；描述文件仍有效至北京时间 2026-11-19 15:19:59。记录位于 `.build/iphone-release/20261112-export-memory-fix/`。此次确认安装/启动，尚未重新触发手机导出，真机内存与闪退修复效果仍待用户复测。
+
+2026-11-12 导出闪退定位：已读取手机 20:39/20:40 的 JetsamEvent，App 被以 `per-process-limit` 终止，16 KiB 页大小下约 393,255–393,268 页（约 6 GiB），不是普通 Swift 异常。新增 ZIP 流式循环虽分块读写，但 FileHandle 底层 Foundation 临时对象缺少逐块 autoreleasepool，累积到任务结束才释放。已仅在 ZIP 读取/CRC/写入循环增加逐块释放，不修改原始数据或输出契约。同一 482 帧本机场景前后对照：最大驻留内存从 460,390,400 降至 38,846,464 字节，修复后完整导出 2.018 秒；峰值 footprint 从 449,332,232 降至 27,591,376 字节。ZIP CRC、文件路径与所有参数/媒体字节核对通过，仅导出时间改变。导出回归和顺序 iPhoneOS/iPhoneSimulator 无签名构建通过。证据为 `.build/export-crash-20261112/diagnosis.json`、两份 Jetsam、`baseline-memory.log`、`fixed-memory.log`。未触发手机新导出，未安装此修复；真机修复效果仍待验收。
+
+2026-11-12 快速打包版真机安装：Release 构建、严格签名校验及描述文件有效期检查通过，沿用原 Team / Bundle ID 原位安装到“云山”，devicectl 启动成功。描述文件有效至北京时间 2026-11-19 15:19:59。包含拍摄结束自动抽帧、流式 ZIP64 加速与单个/批量保存进度条；未卸载 App，未操作原始场景目录。构建、签名描述文件、安装及启动记录位于 `.build/iphone-release/20261112-fast-export/`。本次只验证安装/启动，新拍摄收尾、打包进度 UI 与手机实际耗时仍待测试。
+
+
+2026-11-12 打包性能与进度更新：Beta 单个/批量保存改用 1 MiB 分块、zlib CRC32 的流式 ZIP64 写入，UTF-8 文件名直接写入，取消系统重复压缩、整包复制与 ZIP 头修正；不可变媒体在导出临时目录优先硬链接，不支持时复制，生成的 JSONL/清单独立写入。原始采集数据不改动，逐图解码、参数及深度检查保留。进度按检查/整理文件数及 ZIP 实际写入字节更新，原子发布成功才到 100%。
+
+真实 482 帧/33 抽帧样本在 Mac 上新完整导出为 2.222 秒，同一导出目录的旧系统 ZIP 阶段单独为 14.324 秒（计时范围不同，不代表统一加速比或手机耗时）。采用 ZIP store，不再次压缩，体积从 316,786,849 增至 417,059,435 字节，约增加 32%；1,551 个文件的 CRC、相对路径、媒体和 JSONL 字节核对通过，清单仅有本地目录命名及导出时间差异。报告为 `.build/device-dualframes-validation/fast-zip-validation.json`；日志为 `/tmp/yun-zip-progress-*.log`、`/tmp/yun-system-zip-benchmark.log`。导出兼容、进度单调和失败不报 100% 回归、源码检查通过；手机未操作或安装，真机速度、超过 4 GiB 单文件和超 65,535 条目压力仍未验收。
+
+2026-11-12 抽帧时机调整：仅对新拍摄，停止后等待全帧 JPEG/位姿/连续索引与视频收尾完成，再在临时目录生成独立的 `sampled_0.5s/`（首帧起至少 0.5 秒间隔），成功后原子移动到该新场景内，随后才进入预览并标记处理完成。全帧原始图像与参数不改写；失败/取消不发布半写抽帧目录，也不标记整体成功。已有场景、已有抽帧目录和已保存 ZIP 不自动补写或覆盖。新场景导出复用持久化抽帧 ID，并检查来源摘要；关闭导出深度只影响导出副本，不改变已生成抽帧目录。旧场景缺少该目录时仍可在导出临时副本生成，手机原目录不改。按用户要求本次只改代码和做本地验证，不连接或安装手机。本地 `test_beta_scene.sh` 新增收尾状态为 processing 时生成、原始文件摘要不变、既有目录不覆盖、导出复用及派生目录不变回归，通过；`check_project.py` 和 Xcode 27.3 顺序 iPhoneOS / iPhoneSimulator 无签名构建通过。日志为 `/tmp/yun-stop-sample-*.log` 及 `.build/verification/`；新收尾流程尚未真机验收。
+
+
+2026-11-12 签名续期：旧描述文件于北京时间 2026-11-12 14:06:42 到期，证书本身未到期。已通过 Xcode 自动签名刷新描述文件，新有效期至北京时间 2026-11-19 15:19:59（仍为 7 天）。首次增量构建只更新 embedded.mobileprovision 导致资源封印校验失败，未安装该包；改在独立 DerivedData 完整构建后签名严格校验通过，沿用原 Team / Bundle ID 原位安装。安装后需在手机重新信任开发者，用户完成信任后 devicectl 启动成功，进程查询确认 PID 983。未卸载 App，未修改原始拍摄目录；本次未重新拍摄或生成新 ZIP。构建、描述文件、安装及启动日志位于 `.build/iphone-release/20261112-renewal/`。
+
+
+2026-11-12 双份导出真机验收（单次场景）：已只读取回用户新拍摄的 `scan_20261112_105224_3A3E97` 原始目录和手机生成的 `scan_20261112_105224_3A3E97-arkit-2BB28A02.zip`。原 ARFrame 索引、原 JPEG、全帧 JSONL 均为 482 帧，时间戳跨度 16.033534 秒，实际约 29.9996 fps，1920×1440；482 帧跟踪均为 normal，均有同步深度/置信度。额外 `sampled_0.5s/` 为 33 帧和 33 对深度，实际相邻间隔 0.500006083–0.500006375 秒，严格匹配首帧起每隔至少 0.5 秒的选择规则。视频编码实际写入 480 帧，另外 2 帧的独立 JPEG、原始参数及深度仍保留，未被导出剔除。
+
+ZIP 为 316,786,849 字节、1,551 个文件；CRC、精确目录白名单、同 ID 对应、全部 JPEG 解码/尺寸/方向、深度字节数和置信度取值、全部原始 K/c2w、GL/OpenCV 逆矩阵、所有导出媒体与原始文件逐字节一致，以及抽帧副本与全帧参数/媒体一致均通过。导出清单来源摘要与手机原 poses.jsonl / frames.jsonl 相符；取回的 2,417 个原始文件在本地验证前后摘要未变。本次仅执行读取，不修改手机场景。证据位于 `.build/device-dualframes-validation/validation.json`、`latest.zip`、`source/` 与 `validate.py`。本次完成该场景的全帧与双份 ZIP 验收，不代表长时录制、4K、温度/内存压力或独立几何精度验收。
+
+
+2026-11-12 双份导出：保留场景根目录的全帧 ARKit 数据，额外生成 `sampled_0.5s/`，内部同样包含 scene-package.json、arkit/frames.jsonl、arkit/poses.jsonl、images/ 和可选 depth/。按原 ARFrame.timestamp 时间排序，保留首帧，之后选择距上一保留帧至少 0.5 秒的第一帧；不追加不足间隔的末帧，不叠加质量筛选，不改变原 ID、参数和媒体字节。清单 schemaVersion 8，抽帧副本注明 samplingIntervalSeconds=0.5、sourceFrameCount 及实际 frameCount。只从导出临时全帧副本生成，手机原始采集数据不改动；单个和批量导出均包含两份。本次 `verify_project.sh source`、`test_beta_scene.sh`（12 帧→按 0.5 秒保留 3 帧、原始参数/媒体字节、精确文件白名单、短片首帧、RGB 与批量分支）、`check_project.py` 及 Xcode 27.3 顺序 iPhoneOS / iPhoneSimulator 无签名构建通过。日志为 `/tmp/yun-dualframes-*.log` 和 `.build/verification/`；2026-11-12 双份导出版本已通过 Release 签名构建、签名校验并原位安装到“云山”（沿用原 Team / Bundle ID，未卸载 App）；首次 devicectl 启动被锁屏拒绝；用户解锁后启动成功，进程查询确认 App 运行（PID 5373），日志为 `launch-unlocked.log`。日志位于 `.build/iphone-release/20261112-dualframes/`，App 产物位于复用的 `.build/iphone-release/20261111-compact-arkit/Build/Products/Release-iphoneos/`。手机实际拍摄帧率、完整性与双份 ZIP 尚未验收。
+
+
+2026-11-12 全帧保留调整：Beta 拍摄取消 0.5 秒关键帧间隔及位移/清晰度/跟踪筛选，对采集期间收到的 ARFrame 逐帧复制 JPEG、原始 K/c2w 和可用的同帧深度。JPEG 队列上限 8；复制/写入失败或队列满则停止并保留已有文件，不能静默跳帧后标记成功。收尾核对连续索引帧数与已写 JPEG 数量，并在 beta-capture.json 记录 inputARFrameCount / savedImageFrameCount。精简导出 schemaVersion 7 保留全部已保存帧，不按模糊、跟踪、视频丢帧或深度质量筛选；深度缺失保留图像并标记 not_captured，必需文件缺失/损坏时报错而非减少帧数。已有拍摄目录不改写；旧场景未保存为 JPEG 的帧不会凭空补出。JPEG 沿用现有编码，不等于传感器 RAW。本次 `verify_project.sh source`、`test_beta_scene.sh` 全帧/原导出兼容回归、`test_capture_stream.sh` 编解码/采集包检查、`check_project.py` 和 Xcode 27.3 顺序 iPhoneOS / iPhoneSimulator 无签名构建均通过；日志为 `/tmp/yun-allframes-*.log` 和 `.build/verification/`。未安装本次全帧版本到手机，实际持续帧率、写入压力及真机完整性尚待验证。
+
+
+2026-11-11 精简导出更新：App 内 ARKit 拍摄场景默认单个/批量保存仅包含 `scene-package.json`、`arkit/frames.jsonl`、`arkit/poses.jsonl`、`images/*.jpg` 和可选 `depth/*.f32` / `*.u8`（schemaVersion 6）。不带视频、点云和摄影测量结果，不依赖相机重估；手机原始数据保留。读取字段和坐标契约见 [数据保存格式](docs/数据保存格式.md)。普通视频导入继续使用既有非米制归档。本次 `verify_project.sh source`、25 项本地化检查、`test_beta_scene.sh`（新增精简包精确白名单、原始媒体字节、共享 ID、无摄影测量及默认单个/批量导出）、`check_project.py` 与 Xcode 27.3 顺序 iPhoneOS / iPhoneSimulator 无签名构建通过；仍有既有并发/废弃 API 警告。日志在 `/tmp/yun-compact-*.log` 及 `.build/verification/`。随后连接恢复，精简导出版本已通过 Release 签名构建和签名校验，并原位安装到“云山”；devicectl 启动成功，进程查询确认 PID 2952。沿用原 Team / Bundle ID，未卸载 App。构建、安装及启动日志位于 `.build/iphone-release/20261111-compact-arkit/`。安装前场景目录查询成功，安装后完整目录查询 30 秒超时，因此未声称完成前后数据逐项比对；手机实际 ZIP 和拍摄交互仍待验证。
+
+
+2026-11-11 采集默认流程调整：Beta 停止拍摄后仅完成原始 ARKit 视频、关键帧、位姿及可选 LiDAR 的安全收尾和预览保存，不自动运行摄影测量，不显示全屏计算动画；收尾期间禁用采集操作，完成后进入预览。单个和批量导出默认选择“原始归档”，可直接保存 ARKit 数据。摄影测量保留为场景页手动操作，“重建结果”仍要求有效估计与配准，不伪造结果。本次使用 Xcode 27.3（27C5020n）通过 `verify_project.sh source`、`test_beta_scene.sh`（包含默认原始归档与显式重建导出回归）、`verify_project.sh ios` 顺序真机/模拟器无签名构建，以及 `check_project.py`。仍有既有并发/废弃 API 警告；随后 Release 签名构建与 `codesign --verify --deep --strict` 通过，产物位于 `.build/iphone-release/20261111-arkit-only/Build/Products/Release-iphoneos/arkit-3dgs-scanner.app`。首次安装因设备 unavailable 返回 CoreDeviceError 1011；用户恢复连接后，已向“云山”成功原位安装，并通过 devicectl 启动。沿用 Team / Bundle ID，未卸载 App；本次真机拍摄交互仍待用户实际录制验证。安装与启动日志为该构建目录的 `install.log`、`launch.log`。
+
+
 2026-11-04 双相机导出更新（build 13）：重建包升级 schemaVersion=5，`arkit/poses.jsonl` 和 `realitykit/poses.jsonl` 使用相同有效帧、本次 ARKit 米制世界，默认入口指向 RealityKit。`realitykit/native-cameras.json` 保留筛选后未经配准的原始估计，`alignment.json` 保存已应用的全局旋转、平移、尺度和差异。新估计不再以超过 3 cm 等差异阈值拒绝整组结果，稳健拟合外点也保留有效相机；几何退化仍报错。预览和训练输入继续使用原始 ARKit，完整采集保留，未宣称精度改善。格式与兼容规则见 [数据保存格式](docs/数据保存格式.md)。源码/CPU、相机与归档回归、iPhoneOS / Simulator Debug 顺序构建、Release 签名校验通过，原位安装与设备查询确认为 1.0（13）。
 
 用户先前失败的场景 `scan_20261103_231536_7B954E` 已在手机重新估计并实际保存：44 / 48 组相机，48 张同步深度送入估计，ID 28、41、42、43 未返回相机并从最终两套数据共同排除。真机 UI 用例通过（29.279 秒），显示 3.82 cm 的位置差并成功保存；无需重拍。取回的 ZIP 为 17,501,278 字节、140 个文件，含 44 张图像、两套各 44 组参数、44 对深度/置信度及 44 个原始 RealityKit 返回值。CRC、公共 ID、原始 ARKit K/c2w、尺度/轴转换、K 尺寸换算、GL/OpenCV 逆矩阵、深度大小/有效值和所有来源摘要核对通过；源 poses/frames 与失败前字节一致。首个离线摘要检查使用了重新估计前的旧报告，因报告已更新而不匹配；重新取回手机当前源文件后上述全部摘要检查通过。
@@ -119,6 +153,12 @@ build 11 Release 签名构建、签名校验和原位安装通过，设备查询
 2026-11-03 真机验证（build 10）：已使用原 Team / Bundle ID 签名并原位安装到已连接的 iPhone 18 Pro / iOS 27.2，Release 真机与 Debug 模拟器构建通过。用户配合实际移动录制 30.13 秒，默认 LiDAR ON、1920×1440 / 30 fps；场景 `scan_20261103_173257_121DEF` 有 890 条连续记录、871 个真实视频帧和 871 份同步深度，另有 19 条明确标记的 `media_backpressure` 丢帧，全部记录 trackingState 为 normal。59 张关键帧的 256×192 深度/置信度与同时间连续帧逐字节一致，有效 medium/high 置信度深度占比每帧约 76.3%–98.8%。全部 59 张的深度实际送入 RealityKit，约 64.58 秒返回 57 个相机，56 个通过配准，另存 2,629 个米制点；ID 1、3 无估计，ID 4 因配准异常排除，原始 59 个相机均保留。相对 ARKit 位置差异中位数 1.55 cm、P90 3.32 cm、方向差异中位数 0.64°，仅表示配准一致性。原始关键帧 fx 为 1366.549–1388.803 像素；RealityKit 本次返回共享的 fx=1376.773 像素，逐帧输出并不保证逐帧独立优化焦距。
 
 手机生成的 120,543,916 字节 ZIP（1,936 个条目）已取回；CRC、完整视频 PTS/尺寸解码、逐帧参数、同帧深度、原始 poses SHA-256、K 尺寸换算、c2w/w2c/OpenCV 转换及点云共同变换全部核对通过。手机原有 4 个 Beta 场景及其目录元数据保留。数据、验证与日志在 `.build/metric-camera-device-20261103/`，主报告为 `validation.json`。首条完整 UI 用例到最后保存提示检查时发生 `kAXErrorServerNotFound`，不能标为整条 UI 测试通过；实际采集、估计及 ZIP 文件已独立验证。修正测试控件查询并从场景库定位该场景后，独立重开、显示“56 / 59”估计状态及再次保存 ZIP 的真机 UI 复查通过（16.077 秒，`DeviceReopen.xcresult`）；首条用例仍保留失败记录。签名 App 留存于 `.build/iphone-release/20261103-1.0-b10-metric/`。尚未完成已知实物长度/独立标定精度、后台取消重试、温度/内存压力或精度提升对照；本次成功不能证明此前跨 App 相机异常的根因已解决。
+
+2026-10-29 位姿与尺度文档核对：已在 [采集与存储](docs/采集与存储.md#相机位姿-pipeline数据规范与米制尺度报告2026-10-29) 整理实时相机位姿链路、字段表、目录结构、ARKit 米制语义及拍摄前尺度验证方案。基于源码与 Apple 文档分析，未执行外部真值精度实验，未新增标定功能。
+
+2026-10-29 本机安装进展：Metal Toolchain 已安装，开发签名证书就绪。为 Xcode 26.6 增加后台任务提交 API 的编译器兼容分支；以命令行 `IPHONEOS_DEPLOYMENT_TARGET=26.0` 覆盖（工程最低版本未改），Release iPhoneOS 签名构建和 Debug iPhoneSimulator 无签名构建均通过。签名校验通过，已原位安装到用户指定的“云山”iPhone 18 Pro / iOS 27.2；首次启动请求被锁屏拒绝；解锁后 devicectl 启动成功，后续进程查询确认 App 运行（PID 3742）。Device Hub 的 devices:// 链接在本机无注册处理程序，尚未验证其画面与交互。此构建使用 iOS 26.5 SDK，不含 iOS 27 原生高斯 Viewer 分支，不代表该分支或采集训练验收。日志位于 `.build/verification/current-device.log`、`ios26-simulator.log`。
+
+2026-10-29 新电脑环境检查：实际安装 Xcode 26.6（17F113）、iOS 26.5 SDK，默认 xcode-select 指向 CommandLineTools；验证通过显式 DEVELOPER_DIR 使用完整 Xcode。项目 target 最低版本为 iOS 27.0，`verify_project.sh ios` 在 SDK 前置检查失败，尚未进入 App 编译。Metal Toolchain 缺失，devicectl 未发现连接真机；现有可用模拟器为 iOS 26.5。已打开 Xcode 工程。需准备匹配项目的 SDK/运行时和 Metal 组件，连接并信任设备后继续安装启动验证；本机尚未验证 Device Hub、采集或重建。此前段落是旧机器记录。
 
 交接前程序实现基线是本地提交 `d3396a643ea4f10cfad769e4f1050056a5c182a0`；本次包的完整版本以 `TRANSFER_MANIFEST.json` 为准。该本地提交不是上游 GitHub 提交，重新 clone 上游不能恢复本项目新增功能。
 

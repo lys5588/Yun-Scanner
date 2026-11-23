@@ -21,9 +21,15 @@ import CryptoKit
         try expect(portable.terminationStatus == 0, "portable UTF-8 ZIP headers and CRC")
     }
     static func main() async throws {
+        if CommandLine.arguments.count == 3 && CommandLine.arguments[1] == "--arkit" {
+            let start = Date()
+            let output = try await BetaSceneArchive.shared.save(directory: URL(fileURLWithPath: CommandLine.arguments[2]), includeLiDAR: true)
+            print(output.path); print("Elapsed seconds: \(Date().timeIntervalSince(start))")
+            return
+        }
         if CommandLine.arguments.count == 3 && CommandLine.arguments[1] == "--reconstruction" {
             let source = URL(fileURLWithPath: CommandLine.arguments[2])
-            print(try await BetaSceneArchive.shared.save(directory: source, includeLiDAR: true).path)
+            print(try await BetaSceneArchive.shared.save(directory: source, includeLiDAR: true, contents: .reconstruction).path)
             return
         }
         try await BetaFilteredExportTests.run()

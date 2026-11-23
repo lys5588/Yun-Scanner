@@ -5,6 +5,8 @@ import AVKit
 
 struct BetaSceneView: View {
     let directory: URL
+    @State private var exportProgress = 0.0
+    @State private var exportMessage = ""
     @State private var entry: ScanEntry?
     @State private var preview: ScanPreview?
     @State private var includeLiDAR = false
@@ -21,7 +23,7 @@ struct BetaSceneView: View {
     @State private var estimationTask: Task<Void, Never>?
     @State private var estimating = false
     @State private var estimationProgress = 0.0
-    @State private var exportContents: BetaSceneArchive.Contents = .reconstruction
+    @State private var exportContents: BetaSceneArchive.Contents = .arkit
     @Environment(\.dismiss) private var dismiss
     @Environment(\.scenePhase) private var scenePhase
     var body: some View {
@@ -80,7 +82,7 @@ struct BetaSceneView: View {
                         .accessibilityIdentifier("betaPreviewLiDAR")
                     Text(entry?.usedLiDAR == true
                          ? L10n.text("开启后显示点云，并将采集深度一起保存。")
-                         : L10n.text("此场景未采集 LiDAR，保存视频、影像和位姿。"))
+                         : L10n.text("此场景未采集 LiDAR，仅保存图像和相机位姿。"))
                         .font(.caption).foregroundStyle(.secondary)
                     if entry?.isVideoImport == true {
                         Text(L10n.text("普通视频的估计轨迹为相对尺度，不提供米制距离。"))
@@ -111,21 +113,11 @@ struct BetaSceneView: View {
                     }
                     VStack(alignment: .leading, spacing: 10) {
                         Text(L10n.text("场景数据包")).font(.headline)
-                        Picker(L10n.text("保存内容"), selection: $exportContents) {
-                            Text(L10n.text("重建结果")).tag(BetaSceneArchive.Contents.reconstruction)
-                            Text(L10n.text("原始归档")).tag(BetaSceneArchive.Contents.original)
-                        }.pickerStyle(.segmented).disabled(saving || estimating)
-                            .accessibilityIdentifier("betaExportContents")
-                        if exportContents == .original {
-                            Label(L10n.text("原始视频"), systemImage: "film")
-                            Label(L10n.text("逐帧图像与相机位姿"), systemImage: "photo.stack")
-                        } else {
-                            Label(L10n.text("仅通过筛选的图像与相机参数"), systemImage: "checkmark.circle")
-                            Text(entry?.isVideoImport == true
-                                 ? L10n.text("仅包含有效图像与对应相机参数；原视频与未筛选点云保留在原始归档中。")
-                                 : L10n.text("图像、两套相机参数和深度使用同一有效帧名单；完整视频与未筛选点云保留在原始归档中。"))
-                                .font(.caption).foregroundStyle(.secondary)
-                        }
+                        Label(L10n.text("逐帧图像与相机位姿"), systemImage: "photo.stack")
+                        Text(entry?.isVideoImport == true
+                             ? L10n.text("普通视频的估计轨迹为相对尺度，不提供米制距离。")
+                             : L10n.text("同时保存全帧与 0.5 秒间隔抽帧数据，两份目录结构相同。"))
+                            .font(.caption).foregroundStyle(.secondary)
                         if includeLiDAR { Label(L10n.text("LiDAR 深度与置信度"), systemImage: "square.3.layers.3d") }
                         Text("ZIP · JPEG · JSONL" + (includeLiDAR ? " · F32 / U8" : ""))
                             .font(.caption.monospaced()).foregroundStyle(.secondary)
@@ -159,6 +151,11 @@ struct BetaSceneView: View {
             } message: { Text(L10n.text("将删除场景及原始采集数据；此前导出的 ZIP 会保留。")) }
             .safeAreaInset(edge: .bottom) {
                 VStack(spacing: 10) {
+                    if saving {
+                        ProgressView(value: exportProgress).tint(.orange)
+                        Text(exportMessage + " · " + String(format: "%.0f%%", exportProgress * 100))
+                            .font(.caption.monospacedDigit()).accessibilityIdentifier("betaExportProgress")
+                    }
                     if archive != nil {
                         Label(L10n.text("场景 ZIP 已保存"), systemImage: "checkmark.circle.fill")
                             .font(.caption).foregroundStyle(.green).accessibilityIdentifier("betaSaved")
@@ -170,7 +167,7 @@ struct BetaSceneView: View {
                     } label: {
                         if saving { ProgressView().tint(.white) }
                         else if archive != nil { Label(L10n.text("导出到文件 / 分享"), systemImage: "square.and.arrow.up") }
-                        else { Label(display ? (exportContents == .reconstruction ? L10n.text("保存重建结果 ZIP") : L10n.text("保存原始归档 ZIP")) : L10n.text("进入 Visualization"), systemImage: display ? "square.and.arrow.down" : "cube.transparent") }
+                        else { Label(display ? L10n.text("保存场景数据 ZIP") : L10n.text("进入 Visualization"), systemImage: display ? "square.and.arrow.down" : "cube.transparent") }
                     }.buttonStyle(DSPrimaryButtonStyle(tint: .orange)).disabled(preview == nil || saving || estimating)
                         .accessibilityIdentifier(display ? "betaSaveZIP" : "betaVisualize")
                 }.padding(.horizontal, 24).padding(.vertical, 12).background(DS.Palette.canvas)
@@ -204,12 +201,16 @@ struct BetaSceneView: View {
         } catch { self.error = error.localizedDescription }
     }
     private func save() {
-        saving = true; error = nil
+        saving = true; error = nil; exportProgress = 0; exportMessage = L10n.text("正在检查场景文件…")
         let useDepth = includeLiDAR
         let contents = exportContents
         Task {
             defer { saving = false }
-            do { archive = try await BetaSceneArchive.shared.save(directory: directory, includeLiDAR: useDepth, contents: contents) }
+            do { archive = try await BetaSceneArchive.shared.save(directory: directory, includeLiDAR: useDepth, contents: contents) { value in
+                Task { @MainActor in
+                    if value.fraction >= exportProgress { exportProgress = value.fraction; exportMessage = value.message }
+                }
+            } }
             catch { self.error = error.localizedDescription }
         }
     }
@@ -218,7 +219,7 @@ struct BetaSceneView: View {
         switch report.status {
         case "estimated_aligned":
             return L10n.text("已估计并对齐 \(report.estimatedFrameCount) / \(report.inputFrameCount) 张关键帧；原始参数已保留。")
-                + "\n" + L10n.text("重建包分文件夹保存两套参数，默认使用 RealityKit；当前预览和训练仍使用 ARKit。")
+                + "\n" + L10n.text("当前预览、训练和场景数据导出均使用原始 ARKit 参数。")
                 + "\n" + L10n.text("这些结果尚未通过独立精度验证。")
         case "alignment_rejected": return L10n.text("RealityKit 已返回结果，但坐标配准未完成。请重新估计相机参数；原始结果仍保留。")
         case "unsupported": return L10n.text("设备不支持摄影测量，保留原始 ARKit 参数。")

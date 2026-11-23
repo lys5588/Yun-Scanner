@@ -5,7 +5,9 @@ import SwiftUI
 extension Notification.Name { static let betaLibraryChanged = Notification.Name("betaLibraryChanged") }
 
 struct BetaLibraryView: View {
-    @State private var exportContents: BetaSceneArchive.Contents = .reconstruction
+    @State private var exportProgress = 0.0
+    @State private var exportMessage = ""
+    @State private var exportContents: BetaSceneArchive.Contents = .arkit
     @AppStorage("beta.library.list") private var listLayout = false
     @State private var entries: [ScanEntry] = []
     @State private var selected: Set<String> = []
@@ -74,10 +76,6 @@ struct BetaLibraryView: View {
                                 selected = selected.count == entries.count ? [] : Set(entries.map(\.id))
                             }.accessibilityIdentifier("betaSelectAll")
                         }
-                        Picker(L10n.text("保存内容"), selection: $exportContents) {
-                            Text(L10n.text("重建结果")).tag(BetaSceneArchive.Contents.reconstruction)
-                            Text(L10n.text("原始归档")).tag(BetaSceneArchive.Contents.original)
-                        }.pickerStyle(.segmented)
                         Toggle(L10n.text("包含已采集的 LiDAR"), isOn: $includeLiDAR).font(.caption).tint(.orange)
                         HStack(spacing: 12) {
                             Button(role: .destructive) { deletion = selectedEntries; confirmDelete = true } label: {
@@ -88,7 +86,12 @@ struct BetaLibraryView: View {
                                 else { Label(L10n.text("批量保存"), systemImage: "square.and.arrow.down") }
                             }.buttonStyle(DSPrimaryButtonStyle(tint: .orange)).accessibilityIdentifier("betaBatchSave")
                         }.disabled(selected.isEmpty || busy)
-                        if busy { Text(L10n.text("正在打包所选场景，请保持 App 在前台。")) .font(.caption) }
+                        if busy {
+                            ProgressView(value: exportProgress).tint(.orange)
+                            Text(exportMessage + " · " + String(format: "%.0f%%", exportProgress * 100)).font(.caption.monospacedDigit())
+                                .accessibilityIdentifier("betaBatchExportProgress")
+                            Text(L10n.text("正在打包所选场景，请保持 App 在前台。")).font(.caption)
+                        }
                         if let archive {
                             Button { SystemShare.present([archive]) } label: {
                                 Label(L10n.text("批量 ZIP 已保存"), systemImage: "square.and.arrow.up")
@@ -117,10 +120,14 @@ struct BetaLibraryView: View {
     }
     private func saveBatch() {
         let snapshot = selectedEntries, depth = includeLiDAR, contents = exportContents
-        busy = true; error = nil; archive = nil
+        busy = true; error = nil; archive = nil; exportProgress = 0; exportMessage = L10n.text("正在检查场景文件…")
         Task {
             defer { busy = false }
-            do { archive = try await BetaSceneArchive.shared.saveBatch(entries: snapshot, includeLiDAR: depth, contents: contents) }
+            do { archive = try await BetaSceneArchive.shared.saveBatch(entries: snapshot, includeLiDAR: depth, contents: contents) { value in
+                Task { @MainActor in
+                    if value.fraction >= exportProgress { exportProgress = value.fraction; exportMessage = value.message }
+                }
+            } }
             catch { self.error = error.localizedDescription }
         }
     }
